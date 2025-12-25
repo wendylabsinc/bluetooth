@@ -6,21 +6,28 @@ import Foundation
 import Foundation
 #endif
 
+import DBUS
+import NIOCore
+
+#if canImport(Glibc)
+import Glibc
+#endif
+
 actor _BlueZScanController {
+    private let adapterPath = "/org/bluez/hci0"
+    private let bluezBusName = "org.bluez"
+    private let objectManagerPath = "/"
+
     private var isScanning = false
     private var allowDuplicates = false
     private var scanFilter: ScanFilter?
     private var continuation: AsyncThrowingStream<ScanResult, Error>.Continuation?
-    private var process: Process?
-    private var stdin: FileHandle?
-    private var stdoutPipe: Pipe?
-    private var stderrPipe: Pipe?
-    private var lineBuffer = ""
     private var devices: [String: DeviceState] = [:]
     private var emitted: Set<String> = []
-    private var pendingHexDevice: String?
-    private var pendingHexKind: PendingHexKind?
-    private var pendingHex: [UInt8] = []
+    private var devicePathMap: [String: String] = [:]
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var stopRequested = false
+    private var scanTask: Task<Void, Never>?
 
     func startScan(
         filter: ScanFilter?,
@@ -33,10 +40,13 @@ actor _BlueZScanController {
         isScanning = true
         allowDuplicates = parameters.allowDuplicates
         scanFilter = filter
-        emitted.removeAll()
         devices.removeAll()
+        emitted.removeAll()
+        devicePathMap.removeAll()
 
-        try startProcess(parameters: parameters)
+        scanTask = Task {
+            await runDbusScan(parameters: parameters)
+        }
 
         return AsyncThrowingStream { continuation in
             self.attach(continuation)
@@ -45,13 +55,11 @@ actor _BlueZScanController {
 
     func stopScan() {
         guard isScanning else { return }
-        flushPendingHex()
-        do {
-            try write(["scan off", "quit"])
-        } catch {
+        stopRequested = true
+        if let continuation = stopContinuation {
+            stopContinuation = nil
+            continuation.resume()
         }
-        process?.terminate()
-        finish()
     }
 
     func emit(_ result: ScanResult) {
@@ -77,171 +85,319 @@ actor _BlueZScanController {
         }
     }
 
-    private func startProcess(parameters: ScanParameters) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/bluetoothctl")
-        let inputPipe = Pipe()
-        process.standardInput = inputPipe
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        let verbose = ProcessInfo.processInfo.environment["BLUETOOTH_BLUEZ_VERBOSE"] == "1"
-        attachOutput(pipe: stdoutPipe, verbose: verbose)
-        attachOutput(pipe: stderrPipe, verbose: verbose)
-
-        process.terminationHandler = { [weak self] _ in
-            Task {
-                await self?.cleanup()
-            }
-        }
-
-        try process.run()
-
-        self.process = process
-        self.stdin = inputPipe.fileHandleForWriting
-        self.stdoutPipe = stdoutPipe
-        self.stderrPipe = stderrPipe
-
-        let dupSetting = parameters.allowDuplicates ? "on" : "off"
-        let activeSetting = parameters.active ? "on" : "off"
-        let commands = [
-            "power on",
-            "menu scan",
-            "transport le",
-            "dup \(dupSetting)",
-            "active \(activeSetting)",
-            "back",
-            "scan on",
-        ]
-        try write(commands)
-    }
-
     private func cleanup() {
         isScanning = false
         allowDuplicates = false
         scanFilter = nil
         continuation = nil
-        stdin?.closeFile()
-        stdin = nil
-        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-        stderrPipe?.fileHandleForReading.readabilityHandler = nil
-        stdoutPipe?.fileHandleForReading.closeFile()
-        stderrPipe?.fileHandleForReading.closeFile()
-        stdoutPipe = nil
-        stderrPipe = nil
-        process = nil
-        lineBuffer = ""
         devices.removeAll()
         emitted.removeAll()
-        pendingHexDevice = nil
-        pendingHexKind = nil
-        pendingHex.removeAll()
+        devicePathMap.removeAll()
+        stopContinuation = nil
+        stopRequested = false
+        scanTask?.cancel()
+        scanTask = nil
     }
 
-    private func write(_ commands: [String]) throws {
-        guard let stdin else {
+    private func runDbusScan(parameters: ScanParameters) async {
+        do {
+            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
+            let auth = AuthType.external(userID: String(getuid()))
+
+            try await DBusClient.withConnectionPair(to: address, auth: auth) { replies, send in
+                let incoming = replies
+                let pending = PendingReplies()
+                let connection = DBusConnection(send: send, pending: pending)
+
+                let messageTask = Task { [weak self] in
+                    do {
+                        var stream = incoming
+                        while let message = try await stream.next() {
+                            if message.messageType == .signal {
+                                await self?.handleDbusMessage(message)
+                            } else if let replyTo = message.replyTo {
+                                await pending.resolve(replyTo: replyTo, message: message)
+                            }
+                        }
+                    } catch {
+                        await pending.cancelAll(error)
+                        await self?.finish(error: error)
+                    }
+                }
+
+                defer {
+                    messageTask.cancel()
+                    Task { await pending.cancelAll(CancellationError()) }
+                }
+
+                try await self.performHello(connection)
+                try await self.addMatchRules(connection)
+                try await self.setDiscoveryFilter(connection, parameters: parameters)
+                try await self.startDiscovery(connection)
+                try await self.loadManagedObjects(connection)
+                await self.waitForStop()
+                try await self.stopDiscovery(connection)
+            }
+
+            finish()
+        } catch {
+            finish(error: error)
+        }
+    }
+
+    private func waitForStop() async {
+        if stopRequested {
+            stopRequested = false
             return
         }
 
-        for command in commands {
-            let line = command + "\n"
-            if let data = line.data(using: .utf8) {
-                try stdin.write(contentsOf: data)
+        await withCheckedContinuation { continuation in
+            stopContinuation = continuation
+        }
+        stopContinuation = nil
+        stopRequested = false
+    }
+
+    private func performHello(_ connection: DBusConnection) async throws {
+        let request = DBusRequest.createMethodCall(
+            destination: "org.freedesktop.DBus",
+            path: "/org/freedesktop/DBus",
+            interface: "org.freedesktop.DBus",
+            method: "Hello"
+        )
+        _ = try await send(connection, request: request, action: "Hello")
+    }
+
+    private func addMatchRules(_ connection: DBusConnection) async throws {
+        let rules = [
+            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
+            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
+            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
+        ]
+
+        for rule in rules {
+            let request = DBusRequest.createMethodCall(
+                destination: "org.freedesktop.DBus",
+                path: "/org/freedesktop/DBus",
+                interface: "org.freedesktop.DBus",
+                method: "AddMatch",
+                body: [.string(rule)]
+            )
+            _ = try await send(connection, request: request, action: "AddMatch")
+        }
+    }
+
+    private func setDiscoveryFilter(
+        _ connection: DBusConnection,
+        parameters: ScanParameters
+    ) async throws {
+        var filterDict: [DBusValue: DBusValue] = [:]
+        filterDict[.string("Transport")] = .variant(DBusVariant(.string("le")))
+        filterDict[.string("DuplicateData")] = .variant(DBusVariant(.boolean(parameters.allowDuplicates)))
+
+        if let filter = scanFilter, !filter.serviceUUIDs.isEmpty {
+            let uuids = filter.serviceUUIDs.map { $0.description }
+            let array = DBusValue.array(uuids.map { .string($0) })
+            filterDict[.string("UUIDs")] = .variant(DBusVariant(array))
+        }
+
+        let request = DBusRequest.createMethodCall(
+            destination: bluezBusName,
+            path: adapterPath,
+            interface: "org.bluez.Adapter1",
+            method: "SetDiscoveryFilter",
+            body: [.dictionary(filterDict)]
+        )
+        _ = try await send(connection, request: request, action: "SetDiscoveryFilter")
+    }
+
+    private func startDiscovery(_ connection: DBusConnection) async throws {
+        let request = DBusRequest.createMethodCall(
+            destination: bluezBusName,
+            path: adapterPath,
+            interface: "org.bluez.Adapter1",
+            method: "StartDiscovery"
+        )
+        _ = try await send(connection, request: request, action: "StartDiscovery")
+    }
+
+    private func stopDiscovery(_ connection: DBusConnection) async throws {
+        let request = DBusRequest.createMethodCall(
+            destination: bluezBusName,
+            path: adapterPath,
+            interface: "org.bluez.Adapter1",
+            method: "StopDiscovery"
+        )
+        _ = try await send(connection, request: request, action: "StopDiscovery")
+    }
+
+    private func loadManagedObjects(_ connection: DBusConnection) async throws {
+        let request = DBusRequest.createMethodCall(
+            destination: bluezBusName,
+            path: objectManagerPath,
+            interface: "org.freedesktop.DBus.ObjectManager",
+            method: "GetManagedObjects"
+        )
+        guard let reply = try await send(connection, request: request, action: "GetManagedObjects"),
+              reply.messageType == .methodReturn,
+              let body = reply.body.first,
+              case .dictionary(let objects) = body
+        else {
+            return
+        }
+
+        for (pathValue, interfacesValue) in objects {
+            guard case .objectPath(let path) = pathValue else { continue }
+            guard case .dictionary(let interfaces) = interfacesValue else { continue }
+            if let props = properties(for: "org.bluez.Device1", in: interfaces) {
+                updateDevice(path: path, properties: props)
             }
         }
     }
 
-    private func attachOutput(pipe: Pipe, verbose: Bool) {
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            Task {
-                await self?.handleOutput(data, verbose: verbose)
-            }
-        }
-    }
-
-    private func handleOutput(_ data: Data, verbose: Bool) {
-        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+    private func handleDbusMessage(_ message: DBusMessage) async {
+        guard message.messageType == .signal else { return }
+        guard
+            let interface = headerString(message, code: .interface),
+            let member = headerString(message, code: .member)
+        else {
             return
         }
 
-        lineBuffer += text
-        while let range = lineBuffer.range(of: "\n") {
-            let line = String(lineBuffer[..<range.lowerBound])
-            lineBuffer = String(lineBuffer[range.upperBound...])
-            handleLine(line, verbose: verbose)
+        switch (interface, member) {
+        case ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded"):
+            guard message.body.count >= 2 else { return }
+            guard case .objectPath(let path) = message.body[0] else { return }
+            guard case .dictionary(let interfaces) = message.body[1] else { return }
+            if let props = properties(for: "org.bluez.Device1", in: interfaces) {
+                updateDevice(path: path, properties: props)
+            }
+        case ("org.freedesktop.DBus.ObjectManager", "InterfacesRemoved"):
+            guard message.body.count >= 2 else { return }
+            guard case .objectPath(let path) = message.body[0] else { return }
+            guard case .array(let values) = message.body[1] else { return }
+            if values.contains(where: { value in
+                if case .string(let name) = value {
+                    return name == "org.bluez.Device1"
+                }
+                return false
+            }) {
+                removeDevice(path: path)
+            }
+        case ("org.freedesktop.DBus.Properties", "PropertiesChanged"):
+            guard message.body.count >= 2 else { return }
+            guard case .string(let iface) = message.body[0], iface == "org.bluez.Device1" else { return }
+            guard case .dictionary(let props) = message.body[1] else { return }
+            let path = headerPath(message) ?? ""
+            updateDevice(path: path, properties: props)
+        default:
+            return
         }
     }
 
-    private func handleLine(_ rawLine: String, verbose: Bool) {
-        let line = stripAnsi(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !line.isEmpty else { return }
+    private func properties(
+        for interfaceName: String,
+        in interfaces: [DBusValue: DBusValue]
+    ) -> [DBusValue: DBusValue]? {
+        for (key, value) in interfaces {
+            guard case .string(let name) = key, name == interfaceName else { continue }
+            guard case .dictionary(let props) = value else { continue }
+            return props
+        }
+        return nil
+    }
 
-        if let hexBytes = parseHexBytes(line) {
-            pendingHex.append(contentsOf: hexBytes)
-            return
+    private func updateDevice(path: String, properties: [DBusValue: DBusValue]) {
+        var address = devicePathMap[path] ?? addressFromPath(path)
+        var state: DeviceState? = nil
+
+        for (keyValue, rawValue) in properties {
+            guard case .string(let key) = keyValue else { continue }
+            let value = unwrapVariant(rawValue)
+
+            switch key {
+            case "Address":
+                if case .string(let addr) = value {
+                    address = addr
+                    devicePathMap[path] = addr
+                }
+            case "Name":
+                if case .string(let name) = value {
+                    state = ensureState(address: address)
+                    updateName(&state, name: name)
+                }
+            case "Alias":
+                if case .string(let name) = value {
+                    state = ensureState(address: address)
+                    updateName(&state, name: name)
+                }
+            case "RSSI":
+                if let rssi = parseInt(value) {
+                    state = ensureState(address: address)
+                    state?.rssi = rssi
+                }
+            case "TxPower":
+                if let tx = parseInt(value) {
+                    state = ensureState(address: address)
+                    state?.advertisementData.txPowerLevel = tx
+                }
+            case "UUIDs":
+                if case .array(let values) = value {
+                    let uuids = values.compactMap { entry -> BluetoothUUID? in
+                        guard case .string(let uuid) = entry else { return nil }
+                        return parseBluetoothUUID(uuid)
+                    }
+                    state = ensureState(address: address)
+                    state?.advertisementData.serviceUUIDs = uuids
+                }
+            case "ManufacturerData":
+                if case .dictionary(let values) = value {
+                    if let manufacturer = parseManufacturerData(values) {
+                        state = ensureState(address: address)
+                        state?.advertisementData.manufacturerData = manufacturer
+                    }
+                }
+            case "ServiceData":
+                if case .dictionary(let values) = value {
+                    let data = parseServiceData(values)
+                    state = ensureState(address: address)
+                    state?.advertisementData.serviceData = data
+                }
+            default:
+                break
+            }
         }
 
-        flushPendingHex()
-
-        guard let (address, payload) = parseDeviceLine(line) else { return }
-
-        if verbose {
-            print("[bluez-scan] \(line)")
+        if let updated = state, let address {
+            devices[address] = updated
+        } else if let address {
+            _ = ensureState(address: address)
         }
 
-        if payload.isEmpty {
-            ensureDevice(address: address)
+        if let address {
             emitIfNeeded(address: address)
-            return
         }
-
-        if payload.hasPrefix("RSSI:") {
-            updateRSSI(address: address, payload: payload)
-        } else if payload.hasPrefix("TxPower:") {
-            updateTxPower(address: address, payload: payload)
-        } else if payload.hasPrefix("Name:") || payload.hasPrefix("Alias:") {
-            let name = payload.replacingOccurrences(of: "Name:", with: "")
-                .replacingOccurrences(of: "Alias:", with: "")
-                .trimmingCharacters(in: .whitespaces)
-            updateName(address: address, name: name)
-        } else if payload.hasPrefix("ManufacturerData.Key:") {
-            updateManufacturerKey(address: address, payload: payload)
-        } else if payload.hasPrefix("ManufacturerData.Value:") {
-            pendingHexDevice = address
-            pendingHexKind = .manufacturer
-        } else if payload.hasPrefix("ServiceData.Key:") {
-            updateServiceDataKey(address: address, payload: payload)
-        } else if payload.hasPrefix("ServiceData.Value:") {
-            pendingHexDevice = address
-            if let key = devices[address]?.pendingServiceDataKey {
-                pendingHexKind = .service(key)
-            }
-        } else if payload.hasPrefix("UUIDs:") {
-            updateServiceUUIDs(address: address, payload: payload)
-        } else if payload.contains(":") {
-            // Unknown property; ignore.
-        } else {
-            updateName(address: address, name: payload)
-        }
-
-        emitIfNeeded(address: address)
     }
 
-    private func ensureDevice(address: String) {
-        if devices[address] != nil { return }
+    private func removeDevice(path: String) {
+        guard let address = devicePathMap[path] else { return }
+        devices[address] = nil
+        emitted.remove(address)
+        devicePathMap[path] = nil
+    }
+
+    private func ensureState(address: String?) -> DeviceState? {
+        guard let address else { return nil }
+        if let state = devices[address] {
+            return state
+        }
         let peripheral = Peripheral(id: .address(BluetoothAddress(address)))
-        devices[address] = DeviceState(peripheral: peripheral, advertisementData: AdvertisementData())
+        let state = DeviceState(peripheral: peripheral, advertisementData: AdvertisementData(), rssi: nil)
+        devices[address] = state
+        return state
     }
 
-    private func updateName(address: String, name: String) {
+    private func updateName(_ state: inout DeviceState?, name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let lower = trimmed.lowercased()
@@ -249,59 +405,35 @@ actor _BlueZScanController {
             return
         }
 
-        ensureDevice(address: address)
-        var state = devices[address]!
-        state.peripheral.name = trimmed
-        state.advertisementData.localName = trimmed
-        devices[address] = state
+        if var stateValue = state {
+            stateValue.peripheral.name = trimmed
+            stateValue.advertisementData.localName = trimmed
+            state = stateValue
+        }
     }
 
-    private func updateRSSI(address: String, payload: String) {
-        guard let value = parseNumberInParens(payload) else { return }
-        ensureDevice(address: address)
-        var state = devices[address]!
-        state.rssi = value
-        devices[address] = state
-    }
-
-    private func updateTxPower(address: String, payload: String) {
-        guard let value = parseNumberInParens(payload) else { return }
-        ensureDevice(address: address)
-        var state = devices[address]!
-        state.advertisementData.txPowerLevel = value
-        devices[address] = state
-    }
-
-    private func updateManufacturerKey(address: String, payload: String) {
-        guard let key = parseHexValue(payload) else { return }
-        ensureDevice(address: address)
-        var state = devices[address]!
-        state.pendingManufacturerKey = key
-        devices[address] = state
-    }
-
-    private func updateServiceDataKey(address: String, payload: String) {
-        guard let uuid = parseUUIDValue(payload) else { return }
-        ensureDevice(address: address)
-        var state = devices[address]!
-        state.pendingServiceDataKey = uuid
-        devices[address] = state
-    }
-
-    private func updateServiceUUIDs(address: String, payload: String) {
-        ensureDevice(address: address)
-        var state = devices[address]!
-        let values = payload.replacingOccurrences(of: "UUIDs:", with: "")
-            .trimmingCharacters(in: .whitespaces)
-            .split(separator: " ")
-        for value in values {
-            if let uuid = parseBluetoothUUID(String(value)) {
-                if !state.advertisementData.serviceUUIDs.contains(uuid) {
-                    state.advertisementData.serviceUUIDs.append(uuid)
-                }
+    private func parseManufacturerData(_ dict: [DBusValue: DBusValue]) -> ManufacturerData? {
+        for (key, value) in dict {
+            guard case .uint16(let company) = key else { continue }
+            let payload = unwrapVariant(value)
+            if let data = dataFromValue(payload) {
+                return ManufacturerData(companyIdentifier: company, data: data)
             }
         }
-        devices[address] = state
+        return nil
+    }
+
+    private func parseServiceData(_ dict: [DBusValue: DBusValue]) -> [BluetoothUUID: Data] {
+        var result: [BluetoothUUID: Data] = [:]
+        for (key, value) in dict {
+            guard case .string(let uuidString) = key else { continue }
+            guard let uuid = parseBluetoothUUID(uuidString) else { continue }
+            let payload = unwrapVariant(value)
+            if let data = dataFromValue(payload) {
+                result[uuid] = data
+            }
+        }
+        return result
     }
 
     private func emitIfNeeded(address: String) {
@@ -333,77 +465,77 @@ actor _BlueZScanController {
         return true
     }
 
-    private func flushPendingHex() {
-        guard let address = pendingHexDevice, let kind = pendingHexKind, !pendingHex.isEmpty else {
-            pendingHexDevice = nil
-            pendingHexKind = nil
-            pendingHex.removeAll()
-            return
+    private func send(
+        _ connection: DBusConnection,
+        request: DBusRequest,
+        action: String
+    ) async throws -> DBusMessage? {
+        let serial = try await connection.send.send(request)
+        if request.flags.contains(.noReplyExpected) {
+            return nil
         }
 
-        ensureDevice(address: address)
-        var state = devices[address]!
-        let data = Data(pendingHex)
-        switch kind {
-        case .manufacturer:
-            if let key = state.pendingManufacturerKey {
-                state.advertisementData.manufacturerData = ManufacturerData(companyIdentifier: key, data: data)
-            }
-        case .service(let uuid):
-            state.advertisementData.serviceData[uuid] = data
+        let reply = try await connection.pending.wait(for: serial)
+        if reply.messageType == .error {
+            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            throw BluetoothError.invalidState("D-Bus \(action) failed: \(name)")
         }
-        devices[address] = state
-
-        pendingHexDevice = nil
-        pendingHexKind = nil
-        pendingHex.removeAll()
+        return reply
     }
 
-    private func parseDeviceLine(_ line: String) -> (String, String)? {
-        guard let range = line.range(of: "Device ") else { return nil }
-        let rest = line[range.upperBound...]
-        let parts = rest.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-        guard let address = parts.first else { return nil }
-        let payload = parts.count > 1 ? String(parts[1]) : ""
-        return (String(address), payload)
+    private func dbusErrorName(_ message: DBusMessage) -> String? {
+        guard
+            let field = message.headerFields.first(where: { $0.code == .errorName }),
+            case .string(let name) = field.variant.value
+        else {
+            return nil
+        }
+        return name
     }
 
-    private func parseHexBytes(_ line: String) -> [UInt8]? {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
+    private func headerString(_ message: DBusMessage, code: HeaderField.Code) -> String? {
+        guard let field = message.headerFields.first(where: { $0.code == code }) else { return nil }
+        guard case .string(let value) = field.variant.value else { return nil }
+        return value
+    }
+
+    private func headerPath(_ message: DBusMessage) -> String? {
+        guard let field = message.headerFields.first(where: { $0.code == .path }) else { return nil }
+        guard case .objectPath(let path) = field.variant.value else { return nil }
+        return path
+    }
+
+    private func parseInt(_ value: DBusValue) -> Int? {
+        switch value {
+        case .int16(let v): return Int(v)
+        case .int32(let v): return Int(v)
+        case .int64(let v): return Int(v)
+        case .uint16(let v): return Int(v)
+        case .uint32(let v): return Int(v)
+        case .uint64(let v): return Int(v)
+        default:
+            return nil
+        }
+    }
+
+    private func unwrapVariant(_ value: DBusValue) -> DBusValue {
+        if case .variant(let variant) = value {
+            return variant.value
+        }
+        return value
+    }
+
+    private func dataFromValue(_ value: DBusValue) -> Data? {
+        guard case .array(let values) = value else { return nil }
         var bytes: [UInt8] = []
-        for token in trimmed.split(whereSeparator: { $0 == " " || $0 == "\t" }) {
-            guard token.count == 2, let value = UInt8(token, radix: 16) else {
-                break
+        for entry in values {
+            if case .byte(let byte) = entry {
+                bytes.append(byte)
+            } else {
+                return nil
             }
-            bytes.append(value)
         }
-        return bytes.isEmpty ? nil : bytes
-    }
-
-    private func parseNumberInParens(_ payload: String) -> Int? {
-        guard let start = payload.firstIndex(of: "("),
-              let end = payload.firstIndex(of: ")"),
-              start < end
-        else { return nil }
-        let number = payload[payload.index(after: start)..<end]
-        return Int(number.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-
-    private func parseHexValue(_ payload: String) -> UInt16? {
-        guard let range = payload.range(of: "0x") else { return nil }
-        let valueStart = range.upperBound
-        let hex = payload[valueStart...]
-            .split(whereSeparator: { $0 == " " || $0 == "(" })
-            .first ?? ""
-        return UInt16(hex, radix: 16)
-    }
-
-    private func parseUUIDValue(_ payload: String) -> BluetoothUUID? {
-        let cleaned = payload
-            .replacingOccurrences(of: "ServiceData.Key:", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return parseBluetoothUUID(cleaned)
+        return Data(bytes)
     }
 
     private func parseBluetoothUUID(_ value: String) -> BluetoothUUID? {
@@ -421,21 +553,54 @@ actor _BlueZScanController {
         return nil
     }
 
-    private func stripAnsi(_ value: String) -> String {
-        value.replacingOccurrences(of: "\\u001B\\[[0-9;]*m", with: "", options: .regularExpression)
+    private func addressFromPath(_ path: String) -> String? {
+        guard let range = path.range(of: "/dev_") else { return nil }
+        let suffix = path[range.upperBound...]
+        let address = suffix.replacingOccurrences(of: "_", with: ":")
+        return address
+    }
+
+    private struct DBusConnection {
+        let send: DBusClient.Send
+        let pending: PendingReplies
+    }
+
+    private actor PendingReplies {
+        private var continuations: [UInt32: CheckedContinuation<DBusMessage, Error>] = [:]
+        private var earlyReplies: [UInt32: DBusMessage] = [:]
+
+        func wait(for serial: UInt32) async throws -> DBusMessage {
+            if let message = earlyReplies.removeValue(forKey: serial) {
+                return message
+            }
+
+            return try await withCheckedThrowingContinuation { continuation in
+                continuations[serial] = continuation
+            }
+        }
+
+        func resolve(replyTo serial: UInt32, message: DBusMessage) {
+            if let continuation = continuations.removeValue(forKey: serial) {
+                continuation.resume(returning: message)
+            } else {
+                earlyReplies[serial] = message
+            }
+        }
+
+        func cancelAll(_ error: Error = CancellationError()) {
+            let continuations = self.continuations
+            self.continuations.removeAll()
+            earlyReplies.removeAll()
+            for (_, continuation) in continuations {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     private struct DeviceState {
         var peripheral: Peripheral
         var advertisementData: AdvertisementData
         var rssi: Int?
-        var pendingManufacturerKey: UInt16?
-        var pendingServiceDataKey: BluetoothUUID?
-    }
-
-    private enum PendingHexKind {
-        case manufacturer
-        case service(BluetoothUUID)
     }
 }
 

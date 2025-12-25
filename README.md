@@ -151,6 +151,12 @@ Run the advertising example:
 swift run BluetoothAdvertisingExample --name wendyble --verbose
 ```
 
+Run the discovery example:
+
+```bash
+swift run BluetoothDiscoveryExample --time 10000 --verbose
+```
+
 Run the GATT example (requires backend support for GATT server):
 
 ```bash
@@ -166,5 +172,8 @@ swift run BluetoothL2CAPExample --verbose
 Optional flags:
 
 - `--connectable` to advertise as connectable (may trigger pairing prompts)
-- `--time <ms>` to exit after a duration
+- `--time <ms>` to exit after a duration (advertising/discovery)
+- `--uuid <uuid>` to filter discovery by a service UUID (repeatable)
+- `--name-prefix <prefix>` to filter discovery by local name prefix
+- `--duplicates` to allow duplicate discovery results
 - `--verbose` to show BlueZ output

@@ -30,6 +30,10 @@ let package = Package(
             name: "BluetoothL2CAPExample",
             targets: ["BluetoothL2CAPExample"]
         ),
+        .executable(
+            name: "BluetoothDiscoveryExample",
+            targets: ["BluetoothDiscoveryExample"]
+        ),
     ],
     traits: [
         .default(enabledTraits: []),
@@ -38,13 +42,19 @@ let package = Package(
         .trait(name: "backend_windows", description: "Force the Windows Bluetooth backend.", enabledTraits: []),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0")
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
+        .package(url: "https://github.com/wendylabsinc/dbus.git", from: "0.2.4"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0"),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "Bluetooth",
+            dependencies: [
+                .product(name: "DBUS", package: "dbus", condition: .when(platforms: [.linux])),
+                .product(name: "NIOCore", package: "swift-nio", condition: .when(platforms: [.linux])),
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
                 .define(
@@ -97,6 +107,17 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Examples/L2CAP",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
+            name: "BluetoothDiscoveryExample",
+            dependencies: [
+                "Bluetooth",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Examples/Discovery",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
