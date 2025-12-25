@@ -12,7 +12,7 @@ Cross-platform Bluetooth Low Energy (BLE) Swift package.
 
 **Targets**
 - Apple platforms: CoreBluetooth backend (iOS 26, macOS 26, tvOS 26, watchOS 26, visionOS 26)
-- Linux: BlueZ backend (advertising + discovery implemented; GATT/L2CAP pending)
+- Linux: BlueZ backend (advertising + discovery + central connection implemented; GATT/L2CAP pending)
 - Windows: Windows backend (planned)
 
 This repository currently contains **API and project layout scaffolding** for:

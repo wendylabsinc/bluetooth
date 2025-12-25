@@ -32,9 +32,9 @@ actor _BlueZCentralBackend: _CentralBackend {
         to peripheral: Peripheral,
         options: ConnectionOptions
     ) async throws -> any _PeripheralConnectionBackend {
-        _ = peripheral
-        _ = options
-        throw BluetoothError.unimplemented("BlueZ connect backend")
+        let backend = try _BlueZPeripheralConnectionBackend(peripheral: peripheral, options: options)
+        try await backend.connect()
+        return backend
     }
 }
 
