@@ -31,7 +31,7 @@ Add the package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wendylabsinc/bluetooth.git", from: "0.0.1")
+    .package(url: "https://github.com/wendylabsinc/bluetooth.git", from: "0.0.2")
 ],
 targets: [
     .target(
