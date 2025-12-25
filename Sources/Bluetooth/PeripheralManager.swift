@@ -62,6 +62,10 @@ public actor PeripheralManager {
         await backend.stopAdvertisingSet(id)
     }
 
+    public func disconnect(_ central: Central) async throws {
+        try await backend.disconnect(central)
+    }
+
     public func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
         try await backend.addService(service)
     }

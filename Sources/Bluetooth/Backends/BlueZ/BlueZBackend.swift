@@ -17,6 +17,10 @@ actor _BlueZCentralBackend: _CentralBackend {
         }
     }
 
+    func stopScan() async {
+        await scanController.stopScan()
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -75,6 +79,11 @@ actor _BlueZPeripheralBackend: _PeripheralBackend {
 
     func stopAdvertisingSet(_ id: AdvertisingSetID) async {
         _ = id
+    }
+
+    func disconnect(_ central: Central) async throws {
+        _ = central
+        throw BluetoothError.unimplemented("BlueZ peripheral disconnect backend")
     }
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {

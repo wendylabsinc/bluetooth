@@ -14,6 +14,9 @@ actor _UnsupportedCentralBackend: _CentralBackend {
         }
     }
 
+    func stopScan() async {
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -70,6 +73,11 @@ actor _UnsupportedPeripheralBackend: _PeripheralBackend {
 
     func stopAdvertisingSet(_ id: AdvertisingSetID) async {
         _ = id
+    }
+
+    func disconnect(_ central: Central) async throws {
+        _ = central
+        throw BluetoothError.backendUnavailable
     }
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {

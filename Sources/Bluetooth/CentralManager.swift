@@ -32,6 +32,10 @@ public actor CentralManager {
         try await backend.scan(filter: filter, parameters: parameters)
     }
 
+    public func stopScan() async {
+        await backend.stopScan()
+    }
+
     public func connect(
         to peripheral: Peripheral,
         options: ConnectionOptions = .init()

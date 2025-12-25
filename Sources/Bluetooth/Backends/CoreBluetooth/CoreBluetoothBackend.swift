@@ -16,6 +16,9 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
         }
     }
 
+    func stopScan() async {
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -72,6 +75,11 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
 
     func stopAdvertisingSet(_ id: AdvertisingSetID) async {
         _ = id
+    }
+
+    func disconnect(_ central: Central) async throws {
+        _ = central
+        throw BluetoothError.unimplemented("CoreBluetooth peripheral disconnect backend")
     }
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {

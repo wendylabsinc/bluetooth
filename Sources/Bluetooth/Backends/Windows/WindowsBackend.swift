@@ -15,6 +15,9 @@ actor _WindowsCentralBackend: _CentralBackend {
         }
     }
 
+    func stopScan() async {
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -71,6 +74,11 @@ actor _WindowsPeripheralBackend: _PeripheralBackend {
 
     func stopAdvertisingSet(_ id: AdvertisingSetID) async {
         _ = id
+    }
+
+    func disconnect(_ central: Central) async throws {
+        _ = central
+        throw BluetoothError.unimplemented("Windows peripheral disconnect backend")
     }
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {

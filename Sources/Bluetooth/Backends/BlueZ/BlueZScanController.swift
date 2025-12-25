@@ -26,6 +26,10 @@ actor _BlueZScanController {
         }
     }
 
+    func stopScan() {
+        finish()
+    }
+
     func emit(_ result: ScanResult) {
         continuation?.yield(result)
     }

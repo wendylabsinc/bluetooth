@@ -7,6 +7,7 @@ import Foundation
 protocol _CentralBackend: Actor {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
+    func stopScan() async
 
     func scan(
         filter: ScanFilter?,
@@ -35,6 +36,8 @@ protocol _PeripheralBackend: Actor {
 
     func stopAdvertising() async
     func stopAdvertisingSet(_ id: AdvertisingSetID) async
+
+    func disconnect(_ central: Central) async throws
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration
 
