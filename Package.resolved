@@ -1,13 +1,13 @@
 {
-  "originHash" : "8fdfd58e643876f4ca9a40968ab23362359ce57c8394662ee247e984f0a5c423",
+  "originHash" : "a43f977281597dd32f030df4d9ad57a744f9957bc293b1f0327e234eb8a66045",
   "pins" : [
     {
       "identity" : "dbus",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/wendylabsinc/dbus.git",
       "state" : {
-        "revision" : "2c71124a7baf3fff6346d7ebce6b90c336f0d285",
-        "version" : "0.2.4"
+        "revision" : "a703f6bdc6ee2120ec8e1dc5dc8d2c2cd4c0c3ea",
+        "version" : "0.2.5"
       }
     },
     {

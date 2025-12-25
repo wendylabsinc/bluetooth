@@ -43,7 +43,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
-        .package(url: "https://github.com/wendylabsinc/dbus.git", from: "0.2.4"),
+        .package(url: "https://github.com/wendylabsinc/dbus.git", from: "0.2.5"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0"),
     ],
     targets: [
