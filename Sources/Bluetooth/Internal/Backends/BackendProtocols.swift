@@ -7,7 +7,7 @@ import Foundation
 protocol _CentralBackend: Actor {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
-    func stopScan() async
+    func stopScan() async throws
 
     func scan(
         filter: ScanFilter?,

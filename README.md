@@ -1,3 +1,11 @@
+[![Swift 6.2](https://img.shields.io/badge/Swift-6.2-orange.svg)](https://swift.org)
+[![Platforms](https://img.shields.io/badge/Platforms-iOS%20|%20macOS%20|%20tvOS%20|%20watchOS%20|%20visionOS%20|%20Linux%20|%20Windows-blue.svg)](https://swift.org)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![macOS](https://img.shields.io/github/actions/workflow/status/wendylabsinc/bluetooth/swift.yml?branch=main&label=macOS)](https://github.com/wendylabsinc/bluetooth/actions/workflows/swift.yml)
+[![Linux](https://img.shields.io/github/actions/workflow/status/wendylabsinc/bluetooth/swift.yml?branch=main&label=Linux)](https://github.com/wendylabsinc/bluetooth/actions/workflows/swift.yml)
+[![Windows](https://img.shields.io/github/actions/workflow/status/wendylabsinc/bluetooth/swift.yml?branch=main&label=Windows)](https://github.com/wendylabsinc/bluetooth/actions/workflows/swift.yml)
+[![Documentation](https://img.shields.io/badge/Documentation-DocC-blue)](https://swiftpackageindex.com/wendylabsinc/bluetooth/documentation)
+
 # Bluetooth
 
 Cross-platform Bluetooth Low Energy (BLE) Swift package.

@@ -14,7 +14,8 @@ actor _UnsupportedCentralBackend: _CentralBackend {
         }
     }
 
-    func stopScan() async {
+    func stopScan() async throws {
+        throw BluetoothError.backendUnavailable
     }
 
     func scan(

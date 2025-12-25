@@ -17,7 +17,7 @@ actor _BlueZCentralBackend: _CentralBackend {
         }
     }
 
-    func stopScan() async {
+    func stopScan() async throws {
         await scanController.stopScan()
     }
 

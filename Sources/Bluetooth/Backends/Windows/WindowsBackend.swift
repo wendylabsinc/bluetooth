@@ -15,7 +15,8 @@ actor _WindowsCentralBackend: _CentralBackend {
         }
     }
 
-    func stopScan() async {
+    func stopScan() async throws {
+        throw BluetoothError.unimplemented("Windows stopScan backend")
     }
 
     func scan(

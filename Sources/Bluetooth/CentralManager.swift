@@ -32,8 +32,8 @@ public actor CentralManager {
         try await backend.scan(filter: filter, parameters: parameters)
     }
 
-    public func stopScan() async {
-        await backend.stopScan()
+    public func stopScan() async throws {
+        try await backend.stopScan()
     }
 
     public func connect(

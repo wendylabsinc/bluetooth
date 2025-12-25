@@ -16,7 +16,8 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
         }
     }
 
-    func stopScan() async {
+    func stopScan() async throws {
+        throw BluetoothError.unimplemented("CoreBluetooth stopScan backend")
     }
 
     func scan(
