@@ -94,12 +94,51 @@ struct Demo {
 }
 ```
 
+GATT server (API shape; backend support pending on Linux/Windows):
+
+```swift
+import Bluetooth
+
+let manager = PeripheralManager()
+let service = GATTServiceDefinition(
+    uuid: .bit16(0x180A),
+    characteristics: [
+        GATTCharacteristicDefinition(
+            uuid: .bit16(0x2A29),
+            properties: [.read, .notify],
+            permissions: [.readable],
+            initialValue: Data("wendylabsinc".utf8)
+        )
+    ]
+)
+
+_ = try await manager.addService(service)
+let requests = try await manager.gattRequests()
+
+for try await request in requests {
+    switch request {
+    case .read(let read):
+        await read.respond(.success(Data("wendylabsinc".utf8)))
+    case .write(let write):
+        await write.respond(.failure(.att(.writeNotPermitted)))
+    default:
+        break
+    }
+}
+```
+
 ## Examples
 
 Run the advertising example:
 
 ```bash
 swift run BluetoothAdvertisingExample --name wendyble --verbose
+```
+
+Run the GATT example (requires backend support for GATT server):
+
+```bash
+swift run BluetoothGATTExample --verbose
 ```
 
 Optional flags:

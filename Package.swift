@@ -22,6 +22,10 @@ let package = Package(
             name: "BluetoothAdvertisingExample",
             targets: ["BluetoothAdvertisingExample"]
         ),
+        .executable(
+            name: "BluetoothGATTExample",
+            targets: ["BluetoothGATTExample"]
+        ),
     ],
     traits: [
         .default(enabledTraits: []),
@@ -67,6 +71,17 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Examples/Advertising",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
+            name: "BluetoothGATTExample",
+            dependencies: [
+                "Bluetooth",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Examples/GATT",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
