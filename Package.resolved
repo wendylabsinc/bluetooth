@@ -6,8 +6,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/wendylabsinc/dbus.git",
       "state" : {
-        "revision" : "a703f6bdc6ee2120ec8e1dc5dc8d2c2cd4c0c3ea",
-        "version" : "0.2.5"
+        "branch" : "feature/dbus-hardening",
+        "revision" : "764c3c04959e04d6b0ab80452a9de79caf2185c1"
       }
     },
     {

@@ -104,33 +104,11 @@ actor _BlueZScanController {
             let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
             let auth = AuthType.external(userID: String(getuid()))
 
-            try await DBusClient.withConnectionPair(to: address, auth: auth) { replies, send in
-                let incoming = replies
-                let pending = PendingReplies()
-                let connection = DBusConnection(send: send, pending: pending)
-
-                let messageTask = Task { [weak self] in
-                    do {
-                        var stream = incoming
-                        while let message = try await stream.next() {
-                            if message.messageType == .signal {
-                                await self?.handleDbusMessage(message)
-                            } else if let replyTo = message.replyTo {
-                                await pending.resolve(replyTo: replyTo, message: message)
-                            }
-                        }
-                    } catch {
-                        await pending.cancelAll(error)
-                        await self?.finish(error: error)
-                    }
+            try await DBusClient.withConnection(to: address, auth: auth) { connection in
+                await connection.setMessageHandler { [weak self] message in
+                    await self?.handleDbusMessage(message)
                 }
 
-                defer {
-                    messageTask.cancel()
-                    Task { await pending.cancelAll(CancellationError()) }
-                }
-
-                try await self.performHello(connection)
                 try await self.addMatchRules(connection)
                 try await self.setDiscoveryFilter(connection, parameters: parameters)
                 try await self.startDiscovery(connection)
@@ -158,17 +136,7 @@ actor _BlueZScanController {
         stopRequested = false
     }
 
-    private func performHello(_ connection: DBusConnection) async throws {
-        let request = DBusRequest.createMethodCall(
-            destination: "org.freedesktop.DBus",
-            path: "/org/freedesktop/DBus",
-            interface: "org.freedesktop.DBus",
-            method: "Hello"
-        )
-        _ = try await send(connection, request: request, action: "Hello")
-    }
-
-    private func addMatchRules(_ connection: DBusConnection) async throws {
+    private func addMatchRules(_ connection: DBusClient.Connection) async throws {
         let rules = [
             "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
             "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
@@ -188,7 +156,7 @@ actor _BlueZScanController {
     }
 
     private func setDiscoveryFilter(
-        _ connection: DBusConnection,
+        _ connection: DBusClient.Connection,
         parameters: ScanParameters
     ) async throws {
         var filterDict: [DBusValue: DBusValue] = [:]
@@ -211,7 +179,7 @@ actor _BlueZScanController {
         _ = try await send(connection, request: request, action: "SetDiscoveryFilter")
     }
 
-    private func startDiscovery(_ connection: DBusConnection) async throws {
+    private func startDiscovery(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
             destination: bluezBusName,
             path: adapterPath,
@@ -221,7 +189,7 @@ actor _BlueZScanController {
         _ = try await send(connection, request: request, action: "StartDiscovery")
     }
 
-    private func stopDiscovery(_ connection: DBusConnection) async throws {
+    private func stopDiscovery(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
             destination: bluezBusName,
             path: adapterPath,
@@ -231,7 +199,7 @@ actor _BlueZScanController {
         _ = try await send(connection, request: request, action: "StopDiscovery")
     }
 
-    private func loadManagedObjects(_ connection: DBusConnection) async throws {
+    private func loadManagedObjects(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
             destination: bluezBusName,
             path: objectManagerPath,
@@ -257,12 +225,7 @@ actor _BlueZScanController {
 
     private func handleDbusMessage(_ message: DBusMessage) async {
         guard message.messageType == .signal else { return }
-        guard
-            let interface = headerString(message, code: .interface),
-            let member = headerString(message, code: .member)
-        else {
-            return
-        }
+        guard let interface = message.interface, let member = message.member else { return }
 
         switch (interface, member) {
         case ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded"):
@@ -288,7 +251,7 @@ actor _BlueZScanController {
             guard message.body.count >= 2 else { return }
             guard case .string(let iface) = message.body[0], iface == "org.bluez.Device1" else { return }
             guard case .dictionary(let props) = message.body[1] else { return }
-            let path = headerPath(message) ?? ""
+            let path = message.path ?? ""
             updateDevice(path: path, properties: props)
         default:
             return
@@ -466,16 +429,12 @@ actor _BlueZScanController {
     }
 
     private func send(
-        _ connection: DBusConnection,
+        _ connection: DBusClient.Connection,
         request: DBusRequest,
         action: String
     ) async throws -> DBusMessage? {
-        let serial = try await connection.send.send(request)
-        if request.flags.contains(.noReplyExpected) {
-            return nil
-        }
-
-        let reply = try await connection.pending.wait(for: serial)
+        let reply = try await connection.send(request)
+        guard let reply else { return nil }
         if reply.messageType == .error {
             let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("D-Bus \(action) failed: \(name)")
@@ -493,17 +452,6 @@ actor _BlueZScanController {
         return name
     }
 
-    private func headerString(_ message: DBusMessage, code: HeaderField.Code) -> String? {
-        guard let field = message.headerFields.first(where: { $0.code == code }) else { return nil }
-        guard case .string(let value) = field.variant.value else { return nil }
-        return value
-    }
-
-    private func headerPath(_ message: DBusMessage) -> String? {
-        guard let field = message.headerFields.first(where: { $0.code == .path }) else { return nil }
-        guard case .objectPath(let path) = field.variant.value else { return nil }
-        return path
-    }
 
     private func parseInt(_ value: DBusValue) -> Int? {
         switch value {
@@ -558,43 +506,6 @@ actor _BlueZScanController {
         let suffix = path[range.upperBound...]
         let address = suffix.replacingOccurrences(of: "_", with: ":")
         return address
-    }
-
-    private struct DBusConnection {
-        let send: DBusClient.Send
-        let pending: PendingReplies
-    }
-
-    private actor PendingReplies {
-        private var continuations: [UInt32: CheckedContinuation<DBusMessage, Error>] = [:]
-        private var earlyReplies: [UInt32: DBusMessage] = [:]
-
-        func wait(for serial: UInt32) async throws -> DBusMessage {
-            if let message = earlyReplies.removeValue(forKey: serial) {
-                return message
-            }
-
-            return try await withCheckedThrowingContinuation { continuation in
-                continuations[serial] = continuation
-            }
-        }
-
-        func resolve(replyTo serial: UInt32, message: DBusMessage) {
-            if let continuation = continuations.removeValue(forKey: serial) {
-                continuation.resume(returning: message)
-            } else {
-                earlyReplies[serial] = message
-            }
-        }
-
-        func cancelAll(_ error: Error = CancellationError()) {
-            let continuations = self.continuations
-            self.continuations.removeAll()
-            earlyReplies.removeAll()
-            for (_, continuation) in continuations {
-                continuation.resume(throwing: error)
-            }
-        }
     }
 
     private struct DeviceState {
