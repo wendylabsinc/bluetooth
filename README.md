@@ -52,6 +52,20 @@ sudo systemctl enable --now bluetooth
 
 Optional for debugging (requires root): `btmon` for sniffing HCI traffic.
 
+`btmon` listens at the HCI layer and can confirm that advertising commands were issued and that packets are going out. It needs root or the appropriate capabilities (`CAP_NET_ADMIN`), for example:
+
+```bash
+sudo btmon
+```
+
+Common filters while advertising:
+
+```bash
+sudo btmon | rg -i "LE Set Advertising|LE Advertising Report|Advertising"
+```
+
+Note: most controllers do not loop back their own advertisements, so a local scan on the same adapter may not show your own packets even when advertising is active.
+
 ## Usage
 
 Advertising a local name:
