@@ -46,6 +46,10 @@ actor _BlueZPeripheralBackend: _PeripheralBackend {
         }
     }
 
+    func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
+        throw BluetoothError.unimplemented("BlueZ peripheral connection events backend")
+    }
+
     func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
         try await advertisingController.startAdvertising(
             advertisingData: advertisingData,

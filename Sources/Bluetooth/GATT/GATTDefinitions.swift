@@ -21,15 +21,34 @@ public struct GATTCharacteristicDefinition: Hashable, Sendable, Codable {
     public var properties: GATTCharacteristicProperties
     public var permissions: GATTAttributePermissions
     public var initialValue: Data?
+    public var descriptors: [GATTDescriptorDefinition]
 
     public init(
         uuid: BluetoothUUID,
         properties: GATTCharacteristicProperties,
         permissions: GATTAttributePermissions = [],
-        initialValue: Data? = nil
+        initialValue: Data? = nil,
+        descriptors: [GATTDescriptorDefinition] = []
     ) {
         self.uuid = uuid
         self.properties = properties
+        self.permissions = permissions
+        self.initialValue = initialValue
+        self.descriptors = descriptors
+    }
+}
+
+public struct GATTDescriptorDefinition: Hashable, Sendable, Codable {
+    public var uuid: BluetoothUUID
+    public var permissions: GATTAttributePermissions
+    public var initialValue: Data?
+
+    public init(
+        uuid: BluetoothUUID,
+        permissions: GATTAttributePermissions = [],
+        initialValue: Data? = nil
+    ) {
+        self.uuid = uuid
         self.permissions = permissions
         self.initialValue = initialValue
     }

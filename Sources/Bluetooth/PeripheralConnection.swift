@@ -54,6 +54,14 @@ public actor PeripheralConnection {
         try await backend.notifications(for: characteristic)
     }
 
+    public func setNotificationsEnabled(
+        _ enabled: Bool,
+        for characteristic: GATTCharacteristic,
+        type: GATTClientSubscriptionType = .notification
+    ) async throws {
+        try await backend.setNotificationsEnabled(enabled, for: characteristic, type: type)
+    }
+
     public func discoverDescriptors(
         for characteristic: GATTCharacteristic
     ) async throws -> [GATTDescriptor] {
@@ -70,6 +78,14 @@ public actor PeripheralConnection {
 
     public func readRSSI() async throws -> Int {
         try await backend.readRSSI()
+    }
+
+    public func mtu() async -> Int {
+        await backend.mtu
+    }
+
+    public func mtuUpdates() async -> AsyncStream<Int> {
+        await backend.mtuUpdates()
     }
 
     public func openL2CAPChannel(

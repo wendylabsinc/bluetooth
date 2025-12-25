@@ -23,6 +23,10 @@ public actor PeripheralManager {
         await backend.stateUpdates()
     }
 
+    public func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
+        try await backend.connectionEvents()
+    }
+
     public func startAdvertising(
         _ advertisingData: AdvertisementData,
         parameters: AdvertisingParameters = .init()

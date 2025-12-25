@@ -43,6 +43,10 @@ actor _UnsupportedPeripheralBackend: _PeripheralBackend {
         }
     }
 
+    func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
+        throw BluetoothError.backendUnavailable
+    }
+
     func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
         _ = advertisingData
         _ = scanResponseData

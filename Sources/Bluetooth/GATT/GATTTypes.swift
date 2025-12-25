@@ -84,3 +84,8 @@ public enum GATTNotification: Sendable, Hashable {
     case notification(Data)
     case indication(Data)
 }
+
+public enum GATTClientSubscriptionType: Sendable, Codable, Hashable {
+    case notification
+    case indication
+}

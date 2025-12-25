@@ -22,6 +22,7 @@ protocol _CentralBackend: Actor {
 protocol _PeripheralBackend: Actor {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
+    func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error>
 
     func startAdvertising(
         advertisingData: AdvertisementData,
@@ -47,6 +48,8 @@ protocol _PeripheralBackend: Actor {
 protocol _PeripheralConnectionBackend: Actor {
     var state: PeripheralConnectionState { get }
     func stateUpdates() -> AsyncStream<PeripheralConnectionState>
+    var mtu: Int { get }
+    func mtuUpdates() -> AsyncStream<Int>
 
     func disconnect() async
 
@@ -68,6 +71,12 @@ protocol _PeripheralConnectionBackend: Actor {
     func notifications(
         for characteristic: GATTCharacteristic
     ) async throws -> AsyncThrowingStream<GATTNotification, Error>
+
+    func setNotificationsEnabled(
+        _ enabled: Bool,
+        for characteristic: GATTCharacteristic,
+        type: GATTClientSubscriptionType
+    ) async throws
 
     func discoverDescriptors(for characteristic: GATTCharacteristic) async throws -> [GATTDescriptor]
 

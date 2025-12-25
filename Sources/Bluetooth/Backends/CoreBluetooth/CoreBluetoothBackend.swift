@@ -45,6 +45,10 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         }
     }
 
+    func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
+        throw BluetoothError.unimplemented("CoreBluetooth peripheral connection events backend")
+    }
+
     func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
         _ = advertisingData
         _ = scanResponseData
