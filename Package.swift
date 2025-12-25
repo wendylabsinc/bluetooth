@@ -26,6 +26,10 @@ let package = Package(
             name: "BluetoothGATTExample",
             targets: ["BluetoothGATTExample"]
         ),
+        .executable(
+            name: "BluetoothL2CAPExample",
+            targets: ["BluetoothL2CAPExample"]
+        ),
     ],
     traits: [
         .default(enabledTraits: []),
@@ -82,6 +86,17 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Examples/GATT",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
+            name: "BluetoothL2CAPExample",
+            dependencies: [
+                "Bluetooth",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Examples/L2CAP",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

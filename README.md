@@ -127,6 +127,22 @@ for try await request in requests {
 }
 ```
 
+L2CAP server (API shape; backend support pending on Linux/Windows):
+
+```swift
+import Bluetooth
+
+let manager = PeripheralManager()
+let psm = try await manager.publishL2CAPChannel()
+let incoming = try await manager.incomingL2CAPChannels(psm: psm)
+
+for try await channel in incoming {
+    for try await data in channel.incoming() {
+        try await channel.send(data) // echo
+    }
+}
+```
+
 ## Examples
 
 Run the advertising example:
@@ -139,6 +155,12 @@ Run the GATT example (requires backend support for GATT server):
 
 ```bash
 swift run BluetoothGATTExample --verbose
+```
+
+Run the L2CAP example (requires backend support for L2CAP):
+
+```bash
+swift run BluetoothL2CAPExample --verbose
 ```
 
 Optional flags:
