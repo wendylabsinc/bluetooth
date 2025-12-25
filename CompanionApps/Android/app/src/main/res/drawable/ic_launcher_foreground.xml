@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+
+    <!-- Offset group to center content in safe zone (scale 0.667, translate 170.67) -->
+    <group
+        android:scaleX="0.667"
+        android:scaleY="0.667"
+        android:translateX="170.67"
+        android:translateY="170.67">
+
+        <!-- Filled diamond (rotated square) on the right -->
+        <group
+            android:pivotX="615.44"
+            android:pivotY="514.77"
+            android:rotation="-45">
+            <path
+                android:fillColor="#FFFFFF"
+                android:pathData="M410.91,310.24h409.05v409.05h-409.05z" />
+        </group>
+
+        <!-- Outlined diamond on the left -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M341.82,737.27l-222.51,-222.5l222.51,-222.5l222.5,222.5l-222.5,222.5ZM191.32,514.77l150.51,150.51l150.51,-150.51l-150.51,-150.51l-150.51,150.51Z" />
+    </group>
+</vector>
