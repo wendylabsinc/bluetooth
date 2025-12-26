@@ -209,6 +209,17 @@ Optional flags:
 - `--adapter <name>` to select a BlueZ adapter (for example `hci1`)
 - `--verbose` to show BlueZ output
 
+## Companion Apps
+
+Use the companion apps to test BLE functionality from a mobile device or desktop:
+
+- **Apple** (`CompanionApps/Apple/`): iOS, macOS, tvOS, watchOS, visionOS
+  - Open `BluetoothCompanionApp.xcodeproj` in Xcode and run on your target device
+- **Android** (`CompanionApps/Android/`): Android 12+ (API 31+)
+  - Open in Android Studio and run on your device or emulator
+
+Both apps provide BLE scanning and device discovery for testing against the library examples.
+
 ## Adapter Selection (Linux BlueZ)
 
 Select a specific adapter by name:

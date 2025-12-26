@@ -9,6 +9,7 @@ import CoreBluetooth
 struct DevicesListPage: View {
     @State private var scanner = BLEScanner()
     @State private var searchText = ""
+    @State private var selectedDevice: BLEDevice?
 
     private var filteredDevices: [BLEDevice] {
         let sorted = scanner.sortedDevices
@@ -47,6 +48,9 @@ struct DevicesListPage: View {
                 if canScan && !scanner.isScanning {
                     scanner.startScanning()
                 }
+            }
+            .navigationDestination(item: $selectedDevice) { device in
+                DeviceDetailPage(scanner: scanner, device: device)
             }
         }
     }
@@ -88,11 +92,16 @@ struct DevicesListPage: View {
                 ContentUnavailableView.search(text: searchText)
             } else {
                 ForEach(filteredDevices) { device in
-                    DeviceRowView(device: device)
-                        .transition(.asymmetric(
-                            insertion: .scale.combined(with: .opacity),
-                            removal: .opacity
-                        ))
+                    Button {
+                        selectedDevice = device
+                    } label: {
+                        DeviceRowView(device: device)
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.asymmetric(
+                        insertion: .scale.combined(with: .opacity),
+                        removal: .opacity
+                    ))
                 }
             }
         } header: {
