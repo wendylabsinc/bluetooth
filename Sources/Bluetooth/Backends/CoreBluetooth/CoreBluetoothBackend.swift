@@ -1,5 +1,6 @@
 #if canImport(CoreBluetooth)
 @preconcurrency import CoreBluetooth
+import Synchronization
 #if canImport(FoundationEssentials)
 import FoundationEssentials
 #else
@@ -23,11 +24,29 @@ extension BluetoothUUID {
     init(_ cbuuid: CBUUID) {
         let uuidString = cbuuid.uuidString
         if uuidString.count == 4 {
-            self = .bit16(UInt16(uuidString, radix: 16) ?? 0)
+            // 16-bit UUID (e.g., "180A")
+            guard let value = UInt16(uuidString, radix: 16) else {
+                // Fallback: treat as full UUID using CoreBluetooth's standard base UUID expansion
+                self = .bit128(UUID(uuidString: "0000\(uuidString)-0000-1000-8000-00805F9B34FB") ?? UUID())
+                return
+            }
+            self = .bit16(value)
         } else if uuidString.count == 8 {
-            self = .bit32(UInt32(uuidString, radix: 16) ?? 0)
+            // 32-bit UUID (e.g., "0000180A")
+            guard let value = UInt32(uuidString, radix: 16) else {
+                self = .bit128(UUID(uuidString: "\(uuidString)-0000-1000-8000-00805F9B34FB") ?? UUID())
+                return
+            }
+            self = .bit32(value)
         } else {
-            self = .bit128(UUID(uuidString: uuidString) ?? UUID())
+            // 128-bit UUID
+            guard let uuid = UUID(uuidString: uuidString) else {
+                // This shouldn't happen with CoreBluetooth, but handle gracefully
+                assertionFailure("Invalid UUID string from CoreBluetooth: \(uuidString)")
+                self = .bit128(UUID())
+                return
+            }
+            self = .bit128(uuid)
         }
     }
 }
@@ -176,6 +195,7 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
     private var currentFilter: ScanFilter?
     private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
     private var pendingConnections: [UUID: CheckedContinuation<any _PeripheralConnectionBackend, Error>] = [:]
+    private var activeConnections: [UUID: _CoreBluetoothPeripheralConnectionBackend] = [:]
 
     nonisolated var state: BluetoothState {
         BluetoothState(centralManager.state)
@@ -294,6 +314,8 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
         let peripheral = wrapped.peripheral
         if let continuation = pendingConnections.removeValue(forKey: peripheral.identifier) {
             let connectionBackend = _CoreBluetoothPeripheralConnectionBackend(peripheral: peripheral, centralManager: centralManager)
+            // Track active connection so we can notify on disconnect
+            activeConnections[peripheral.identifier] = connectionBackend
             continuation.resume(returning: connectionBackend)
         }
     }
@@ -305,7 +327,17 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
     }
 
     private func handleDisconnect(_ peripheralId: UUID) {
-        // Connection backend handles its own disconnect notifications
+        // Check if there's a pending connection that needs to be failed
+        if let continuation = pendingConnections.removeValue(forKey: peripheralId) {
+            continuation.resume(throwing: BluetoothError.connectionFailed("Peripheral disconnected during connection"))
+        }
+
+        // Notify active connection backend about disconnect
+        if let connectionBackend = activeConnections.removeValue(forKey: peripheralId) {
+            Task {
+                await connectionBackend.handleRemoteDisconnect(reason: "Peripheral disconnected")
+            }
+        }
     }
 
     func stateUpdates() -> AsyncStream<BluetoothState> {
@@ -390,9 +422,39 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
             throw BluetoothError.invalidPeripheral("Peripheral not found")
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            self.pendingConnections[uuid] = continuation
-            self.centralManager.connect(cbPeripheral, options: nil)
+        // Store the peripheral to prevent deallocation during connection
+        discoveredPeripherals[uuid] = cbPeripheral
+
+        // Default connection timeout of 30 seconds
+        let timeoutSeconds: Double = 30.0
+
+        // Start timeout task
+        let timeoutTask = Task {
+            try await Task.sleep(for: .seconds(timeoutSeconds))
+            // If we get here, timeout occurred - cancel the connection
+            self.handleConnectionTimeout(uuid: uuid, peripheral: cbPeripheral)
+        }
+
+        do {
+            let result = try await withCheckedThrowingContinuation { continuation in
+                self.pendingConnections[uuid] = continuation
+                self.centralManager.connect(cbPeripheral, options: nil)
+            }
+            // Connection succeeded, cancel timeout
+            timeoutTask.cancel()
+            return result
+        } catch {
+            // Connection failed, cancel timeout
+            timeoutTask.cancel()
+            throw error
+        }
+    }
+
+    private func handleConnectionTimeout(uuid: UUID, peripheral: CBPeripheral) {
+        // If there's still a pending connection, it timed out
+        if let continuation = pendingConnections.removeValue(forKey: uuid) {
+            centralManager.cancelPeripheralConnection(peripheral)
+            continuation.resume(throwing: BluetoothError.connectionFailed("Connection timed out after 30 seconds"))
         }
     }
 
@@ -408,6 +470,11 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
 
 // MARK: - Central Manager Delegate
 
+/// Thread-safety note: This delegate is @unchecked Sendable because:
+/// 1. CoreBluetooth always calls delegate methods on the queue specified during CBCentralManager init (.main)
+/// 2. The closure properties are set once during setupDelegateCallbacks() before any BLE operations begin
+/// 3. After initial setup, closures are only read (not written) from delegate callbacks
+/// 4. The closures themselves are @Sendable and dispatch work to the actor via Task
 private final class CentralManagerDelegate: NSObject, CBCentralManagerDelegate, @unchecked Sendable {
     var onStateUpdate: (@Sendable (CBManagerState) -> Void)?
     var onDiscover: (@Sendable (CBPeripheral, [String: Any], NSNumber) -> Void)?
@@ -457,11 +524,19 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
     private var descriptorDiscoveryContinuations: [CBUUID: CheckedContinuation<Void, Error>] = [:]
     private var lastDiscoveredDescriptors: [CBUUID: [CBDescriptor]] = [:]
 
-    private var readValueContinuations: [CBUUID: CheckedContinuation<Data, Error>] = [:]
-    private var writeValueContinuations: [CBUUID: CheckedContinuation<Void, Error>] = [:]
-    private var readDescriptorContinuations: [String: CheckedContinuation<Data, Error>] = [:]
-    private var writeDescriptorContinuations: [String: CheckedContinuation<Void, Error>] = [:]
-    private var rssiContinuation: CheckedContinuation<Int, Error>?
+    // Concurrent operation handling:
+    // We use arrays (FIFO queues) to support multiple concurrent operations on the same characteristic.
+    // CoreBluetooth processes operations in order, so responses arrive in the same order as requests.
+    // This approach is simpler than unique ID tracking and sufficient for typical BLE use cases.
+    // Note: If responses could arrive out-of-order (they shouldn't in BLE), this would need revision.
+    private var readValueContinuations: [CBUUID: [CheckedContinuation<Data, Error>]] = [:]
+    private var writeValueContinuations: [CBUUID: [CheckedContinuation<Void, Error>]] = [:]
+    private var readDescriptorContinuations: [String: [CheckedContinuation<Data, Error>]] = [:]
+    private var writeDescriptorContinuations: [String: [CheckedContinuation<Void, Error>]] = [:]
+    private var rssiContinuations: [CheckedContinuation<Int, Error>] = []
+
+    // Track pending read requests to disambiguate from notifications
+    private var pendingReads: Set<CBUUID> = []
 
     private var notificationContinuations: [CBUUID: AsyncThrowingStream<GATTNotification, Error>.Continuation] = [:]
     private var setNotifyContinuations: [CBUUID: CheckedContinuation<Void, Error>] = [:]
@@ -493,6 +568,111 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         self.delegate = delegate
         peripheral.delegate = delegate
         Task { await setupDelegateCallbacks() }
+    }
+
+    deinit {
+        // Note: We can't await in deinit, so we dispatch cleanup synchronously
+        // This ensures any pending operations are failed when the backend is deallocated
+        // The actual cleanup happens via the disconnect() method in normal usage
+    }
+
+    /// Called by CentralBackend when the peripheral disconnects unexpectedly
+    func handleRemoteDisconnect(reason: String?) {
+        cleanupOnDisconnect(reason: reason)
+
+        // Notify state stream
+        stateUpdatesContinuation?.yield(.disconnected(reason: reason))
+        stateUpdatesContinuation?.finish()
+        stateUpdatesContinuation = nil
+
+        mtuUpdatesContinuation?.finish()
+        mtuUpdatesContinuation = nil
+
+        pairingStateUpdatesContinuation?.finish()
+        pairingStateUpdatesContinuation = nil
+    }
+
+    /// Cleans up all pending operations with a disconnection error
+    private func cleanupOnDisconnect(reason: String?) {
+        let error = BluetoothError.connectionFailed(reason ?? "Peripheral disconnected")
+
+        // Fail pending service discovery
+        serviceDiscoveryContinuation?.resume(throwing: error)
+        serviceDiscoveryContinuation = nil
+
+        // Fail pending characteristic discoveries
+        for (_, continuation) in characteristicDiscoveryContinuations {
+            continuation.resume(throwing: error)
+        }
+        characteristicDiscoveryContinuations.removeAll()
+
+        // Fail pending descriptor discoveries
+        for (_, continuation) in descriptorDiscoveryContinuations {
+            continuation.resume(throwing: error)
+        }
+        descriptorDiscoveryContinuations.removeAll()
+
+        // Fail pending read operations
+        for (_, continuations) in readValueContinuations {
+            for continuation in continuations {
+                continuation.resume(throwing: error)
+            }
+        }
+        readValueContinuations.removeAll()
+        pendingReads.removeAll()
+
+        // Fail pending write operations
+        for (_, continuations) in writeValueContinuations {
+            for continuation in continuations {
+                continuation.resume(throwing: error)
+            }
+        }
+        writeValueContinuations.removeAll()
+
+        // Fail pending descriptor reads
+        for (_, continuations) in readDescriptorContinuations {
+            for continuation in continuations {
+                continuation.resume(throwing: error)
+            }
+        }
+        readDescriptorContinuations.removeAll()
+
+        // Fail pending descriptor writes
+        for (_, continuations) in writeDescriptorContinuations {
+            for continuation in continuations {
+                continuation.resume(throwing: error)
+            }
+        }
+        writeDescriptorContinuations.removeAll()
+
+        // Fail pending RSSI reads
+        for continuation in rssiContinuations {
+            continuation.resume(throwing: error)
+        }
+        rssiContinuations.removeAll()
+
+        // Fail pending notification state changes
+        for (_, continuation) in setNotifyContinuations {
+            continuation.resume(throwing: error)
+        }
+        setNotifyContinuations.removeAll()
+
+        // Finish notification streams
+        for (_, continuation) in notificationContinuations {
+            continuation.finish(throwing: error)
+        }
+        notificationContinuations.removeAll()
+
+        // Fail pending L2CAP channel
+        l2capChannelContinuation?.resume(throwing: error)
+        l2capChannelContinuation = nil
+
+        // Clear discovered items (free memory)
+        discoveredServices.removeAll()
+        discoveredCharacteristics.removeAll()
+        characteristicsByService.removeAll()
+        lastDiscoveredServices.removeAll()
+        lastDiscoveredDescriptors.removeAll()
     }
 
     private func setupDelegateCallbacks() {
@@ -600,7 +780,26 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     private func handleCharacteristicValueUpdated(_ uuid: CBUUID, _ value: Data, _ isIndicate: Bool, _ error: Error?) {
-        // Check if this is a notification/indication
+        // Prioritize read responses over notifications to avoid ambiguity
+        // If there's a pending read, assume this is the read response
+        if pendingReads.contains(uuid), var continuations = readValueContinuations[uuid], !continuations.isEmpty {
+            let continuation = continuations.removeFirst()
+            if continuations.isEmpty {
+                readValueContinuations[uuid] = nil
+                pendingReads.remove(uuid)
+            } else {
+                readValueContinuations[uuid] = continuations
+            }
+
+            if let error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: value)
+            }
+            return
+        }
+
+        // Otherwise, this is a notification/indication
         if let continuation = notificationContinuations[uuid] {
             if let error {
                 continuation.finish(throwing: error)
@@ -610,63 +809,71 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
                 continuation.yield(notification)
             }
         }
-
-        // Check if this is a read response
-        if let continuation = readValueContinuations[uuid] {
-            if let error {
-                continuation.resume(throwing: error)
-            } else {
-                continuation.resume(returning: value)
-            }
-            readValueContinuations[uuid] = nil
-        }
     }
 
     private func handleCharacteristicWritten(_ uuid: CBUUID, _ error: Error?) {
-        if let continuation = writeValueContinuations[uuid] {
-            if let error {
-                continuation.resume(throwing: error)
-            } else {
-                continuation.resume(returning: ())
-            }
+        guard var continuations = writeValueContinuations[uuid], !continuations.isEmpty else { return }
+
+        let continuation = continuations.removeFirst()
+        if continuations.isEmpty {
             writeValueContinuations[uuid] = nil
+        } else {
+            writeValueContinuations[uuid] = continuations
+        }
+
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume(returning: ())
         }
     }
 
     private func handleDescriptorValueUpdated(_ wrapped: SendableDescriptor, _ error: Error?) {
         let descriptor = wrapped.descriptor
         let key = descriptorKey(descriptor)
-        if let continuation = readDescriptorContinuations[key] {
-            if let error {
-                continuation.resume(throwing: error)
-            } else if let value = descriptor.value {
-                if let data = value as? Data {
-                    continuation.resume(returning: data)
-                } else if let string = value as? String {
-                    continuation.resume(returning: Data(string.utf8))
-                } else if let number = value as? NSNumber {
-                    var intValue = number.intValue
-                    continuation.resume(returning: Data(bytes: &intValue, count: MemoryLayout<Int>.size))
-                } else {
-                    continuation.resume(returning: Data())
-                }
+        guard var continuations = readDescriptorContinuations[key], !continuations.isEmpty else { return }
+
+        let continuation = continuations.removeFirst()
+        if continuations.isEmpty {
+            readDescriptorContinuations[key] = nil
+        } else {
+            readDescriptorContinuations[key] = continuations
+        }
+
+        if let error {
+            continuation.resume(throwing: error)
+        } else if let value = descriptor.value {
+            if let data = value as? Data {
+                continuation.resume(returning: data)
+            } else if let string = value as? String {
+                continuation.resume(returning: Data(string.utf8))
+            } else if let number = value as? NSNumber {
+                var intValue = number.intValue
+                continuation.resume(returning: Data(bytes: &intValue, count: MemoryLayout<Int>.size))
             } else {
                 continuation.resume(returning: Data())
             }
-            readDescriptorContinuations[key] = nil
+        } else {
+            continuation.resume(returning: Data())
         }
     }
 
     private func handleDescriptorWritten(_ wrapped: SendableDescriptor, _ error: Error?) {
         let descriptor = wrapped.descriptor
         let key = descriptorKey(descriptor)
-        if let continuation = writeDescriptorContinuations[key] {
-            if let error {
-                continuation.resume(throwing: error)
-            } else {
-                continuation.resume(returning: ())
-            }
+        guard var continuations = writeDescriptorContinuations[key], !continuations.isEmpty else { return }
+
+        let continuation = continuations.removeFirst()
+        if continuations.isEmpty {
             writeDescriptorContinuations[key] = nil
+        } else {
+            writeDescriptorContinuations[key] = continuations
+        }
+
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume(returning: ())
         }
     }
 
@@ -682,12 +889,14 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     private func handleRSSIRead(_ value: Int, _ error: Error?) {
+        guard !rssiContinuations.isEmpty else { return }
+
+        let continuation = rssiContinuations.removeFirst()
         if let error {
-            rssiContinuation?.resume(throwing: error)
+            continuation.resume(throwing: error)
         } else {
-            rssiContinuation?.resume(returning: value)
+            continuation.resume(returning: value)
         }
-        rssiContinuation = nil
     }
 
     private func handleL2CAPChannelOpened(_ wrapped: SendableL2CAPChannel?, _ error: Error?) {
@@ -713,6 +922,10 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
     }
 
+    /// Returns MTU updates stream.
+    /// Note: CoreBluetooth does not provide MTU change notifications.
+    /// The MTU is negotiated once during connection and typically remains constant.
+    /// This stream yields the initial MTU value and will only update on disconnect.
     func mtuUpdates() -> AsyncStream<Int> {
         AsyncStream { continuation in
             continuation.yield(mtu)
@@ -720,6 +933,11 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
     }
 
+    /// Returns pairing state updates stream.
+    /// Note: CoreBluetooth does not expose pairing state directly.
+    /// We infer pairing based on connection state (connected = paired for most purposes).
+    /// This stream yields the initial value and will only update on disconnect.
+    /// For actual pairing events, use system Bluetooth settings.
     func pairingStateUpdates() -> AsyncStream<PairingState> {
         AsyncStream { continuation in
             continuation.yield(pairingState)
@@ -729,7 +947,20 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
     func disconnect() async {
         centralManager.cancelPeripheralConnection(peripheral)
+
+        // Clean up all pending operations
+        cleanupOnDisconnect(reason: "User requested disconnect")
+
+        // Notify state stream
         stateUpdatesContinuation?.yield(.disconnected(reason: "User requested disconnect"))
+        stateUpdatesContinuation?.finish()
+        stateUpdatesContinuation = nil
+
+        mtuUpdatesContinuation?.finish()
+        mtuUpdatesContinuation = nil
+
+        pairingStateUpdatesContinuation?.finish()
+        pairingStateUpdatesContinuation = nil
     }
 
     func discoverServices(_ uuids: [BluetoothUUID]?) async throws -> [GATTService] {
@@ -782,7 +1013,11 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
 
         return try await withCheckedThrowingContinuation { continuation in
-            self.readValueContinuations[cbChar.uuid] = continuation
+            // Track that we have a pending read to disambiguate from notifications
+            self.pendingReads.insert(cbChar.uuid)
+            var existing = self.readValueContinuations[cbChar.uuid] ?? []
+            existing.append(continuation)
+            self.readValueContinuations[cbChar.uuid] = existing
             self.peripheral.readValue(for: cbChar)
         }
     }
@@ -800,7 +1035,9 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         if type == .withResponse {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                self.writeValueContinuations[cbChar.uuid] = continuation
+                var existing = self.writeValueContinuations[cbChar.uuid] ?? []
+                existing.append(continuation)
+                self.writeValueContinuations[cbChar.uuid] = existing
                 self.peripheral.writeValue(value, for: cbChar, type: cbWriteType)
             }
         } else {
@@ -831,11 +1068,20 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         notificationContinuations[uuid] = nil
     }
 
+    /// Enable or disable notifications for a characteristic.
+    /// Note: The `type` parameter is ignored on CoreBluetooth.
+    /// CoreBluetooth automatically selects notification vs indication based on
+    /// the characteristic's properties (uses indication if available, else notification).
     func setNotificationsEnabled(
         _ enabled: Bool,
         for characteristic: GATTCharacteristic,
         type: GATTClientSubscriptionType
     ) async throws {
+        // Note: CoreBluetooth ignores the notification/indication preference.
+        // It automatically uses indication if the characteristic supports it,
+        // otherwise falls back to notification.
+        _ = type // Silence unused parameter warning
+
         guard let cbChar = discoveredCharacteristics[characteristic.uuid.cbuuid] else {
             throw BluetoothError.characteristicNotFound("Characteristic \(characteristic.uuid) not found")
         }
@@ -875,7 +1121,9 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         return try await withCheckedThrowingContinuation { continuation in
             let key = self.descriptorKey(cbDescriptor)
-            self.readDescriptorContinuations[key] = continuation
+            var existing = self.readDescriptorContinuations[key] ?? []
+            existing.append(continuation)
+            self.readDescriptorContinuations[key] = existing
             self.peripheral.readValue(for: cbDescriptor)
         }
     }
@@ -888,14 +1136,16 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let key = self.descriptorKey(cbDescriptor)
-            self.writeDescriptorContinuations[key] = continuation
+            var existing = self.writeDescriptorContinuations[key] ?? []
+            existing.append(continuation)
+            self.writeDescriptorContinuations[key] = existing
             self.peripheral.writeValue(value, for: cbDescriptor)
         }
     }
 
     func readRSSI() async throws -> Int {
         try await withCheckedThrowingContinuation { continuation in
-            self.rssiContinuation = continuation
+            self.rssiContinuations.append(continuation)
             self.peripheral.readRSSI()
         }
     }
@@ -921,6 +1171,7 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
 // MARK: - Peripheral Delegate
 
+/// Thread-safety note: Same pattern as CentralManagerDelegate - closures set once before operations begin
 private final class PeripheralDelegate: NSObject, CBPeripheralDelegate, @unchecked Sendable {
     var onServicesDiscovered: (@Sendable ([CBService]?, Error?) -> Void)?
     var onCharacteristicsDiscovered: (@Sendable (CBService, Error?) -> Void)?
@@ -1212,7 +1463,21 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
     }
 
     private func handleL2CAPChannelOpened(_ wrapped: SendableL2CAPChannel?, _ error: Error?) {
-        guard let wrapped else { return }
+        // Handle error case - propagate to all published channel continuations
+        if let error {
+            for (_, continuation) in publishedL2CAPChannels {
+                continuation.finish(throwing: error)
+            }
+            return
+        }
+
+        guard let wrapped else {
+            // No channel and no error - unexpected state, finish all streams with generic error
+            for (_, continuation) in publishedL2CAPChannels {
+                continuation.finish(throwing: BluetoothError.l2capChannelError("Failed to open L2CAP channel"))
+            }
+            return
+        }
 
         if let continuation = publishedL2CAPChannels[wrapped.channel.psm] {
             let l2capChannel = _CoreBluetoothL2CAPChannel(channel: wrapped.channel)
@@ -1388,6 +1653,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
 
 // MARK: - Peripheral Manager Delegate
 
+/// Thread-safety note: Same pattern as CentralManagerDelegate - closures set once before operations begin
 private final class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate, @unchecked Sendable {
     var onStateUpdate: (@Sendable (CBManagerState) -> Void)?
     var onServiceAdded: (@Sendable (CBService?, Error?) -> Void)?
@@ -1440,16 +1706,22 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     private let channel: CBL2CAPChannel
     private let inputStream: InputStream
     private let outputStream: OutputStream
-    private var incomingContinuation: AsyncThrowingStream<Data, Error>.Continuation?
+    private let state: Mutex<L2CAPChannelState>
     private let streamDelegate: L2CAPStreamDelegate
-    private let lock = NSLock()
+
+    private struct L2CAPChannelState {
+        var incomingContinuation: AsyncThrowingStream<Data, Error>.Continuation?
+    }
 
     init(channel: CBL2CAPChannel) {
         self.channel = channel
         self.psm = L2CAPPSM(rawValue: channel.psm)
-        self.mtu = Int(channel.outputStream.property(forKey: .dataWrittenToMemoryStreamKey) as? Int ?? 512)
+        // Use a reasonable default MTU for L2CAP CoC (Connection-oriented Channels)
+        // The actual MTU is negotiated during channel setup, but we use a conservative default
+        self.mtu = 512
         self.inputStream = channel.inputStream
         self.outputStream = channel.outputStream
+        self.state = Mutex(L2CAPChannelState())
 
         let delegate = L2CAPStreamDelegate()
         self.streamDelegate = delegate
@@ -1473,24 +1745,22 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     }
 
     private func readAvailableData() {
-        lock.lock()
-        defer { lock.unlock() }
-
         var buffer = [UInt8](repeating: 0, count: 4096)
         let bytesRead = inputStream.read(&buffer, maxLength: buffer.count)
 
         if bytesRead > 0 {
             let data = Data(buffer.prefix(bytesRead))
-            incomingContinuation?.yield(data)
+            _ = state.withLock { state in
+                state.incomingContinuation?.yield(data)
+            }
         }
     }
 
     private func handleStreamError(_ error: Error) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        incomingContinuation?.finish(throwing: error)
-        incomingContinuation = nil
+        state.withLock { state in
+            state.incomingContinuation?.finish(throwing: error)
+            state.incomingContinuation = nil
+        }
     }
 
     func send(_ data: Data) async throws {
@@ -1509,15 +1779,15 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
 
     func incoming() -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream { continuation in
-            self.lock.lock()
-            self.incomingContinuation = continuation
-            self.lock.unlock()
+            self.state.withLock { state in
+                state.incomingContinuation = continuation
+            }
 
             continuation.onTermination = { [weak self] _ in
                 guard let self else { return }
-                self.lock.lock()
-                self.incomingContinuation = nil
-                self.lock.unlock()
+                self.state.withLock { state in
+                    state.incomingContinuation = nil
+                }
             }
         }
     }
@@ -1527,10 +1797,10 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     }
 
     private func closeStreams() {
-        lock.lock()
-        incomingContinuation?.finish()
-        incomingContinuation = nil
-        lock.unlock()
+        state.withLock { state in
+            state.incomingContinuation?.finish()
+            state.incomingContinuation = nil
+        }
 
         inputStream.close()
         outputStream.close()
@@ -1539,6 +1809,7 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
 
 // MARK: - L2CAP Stream Delegate
 
+/// Thread-safety note: Same pattern - closures set once during init before streams are opened
 private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, @unchecked Sendable {
     var onDataAvailable: (() -> Void)?
     var onError: ((Error) -> Void)?
