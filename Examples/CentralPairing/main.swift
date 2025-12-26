@@ -4,6 +4,8 @@ import Dispatch
 
 #if os(Linux)
 import Glibc
+#elseif os(Windows)
+// Windows doesn't provide Darwin/Glibc.
 #else
 import Darwin
 #endif
@@ -41,7 +43,9 @@ struct CentralPairingExample: AsyncParsableCommand {
 
     mutating func run() async throws {
         if verbose {
+            #if !os(Windows)
             setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
+            #endif
         }
 
         let options = BluetoothOptions(adapter: adapter.map(BluetoothAdapter.init))
@@ -97,6 +101,11 @@ struct CentralPairingExample: AsyncParsableCommand {
     }
 
     private func waitForInterrupt() async {
+        #if os(Windows)
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+        }
+        #else
         await withCheckedContinuation { continuation in
             let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
             signal(SIGINT, SIG_IGN)
@@ -106,6 +115,7 @@ struct CentralPairingExample: AsyncParsableCommand {
             }
             signalSource.resume()
         }
+        #endif
     }
 
     private static func startPairingTask(
