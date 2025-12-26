@@ -2,7 +2,9 @@ import ArgumentParser
 import Bluetooth
 import Dispatch
 
-#if canImport(FoundationEssentials)
+#if os(Windows)
+import Foundation
+#elseif canImport(FoundationEssentials)
 import FoundationEssentials
 #else
 import Foundation
