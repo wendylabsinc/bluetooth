@@ -1,5 +1,5 @@
 enum _BackendFactory {
-    static func makeCentral() -> any _CentralBackend {
+    static func makeCentral(options: BluetoothOptions) -> any _CentralBackend {
 #if BLUETOOTH_BACKEND_FORCE_COREBLUETOOTH
 #if canImport(CoreBluetooth)
         return _CoreBluetoothCentralBackend()
@@ -8,7 +8,7 @@ enum _BackendFactory {
 #endif
 #elseif BLUETOOTH_BACKEND_FORCE_BLUEZ
 #if os(Linux)
-        return _BlueZCentralBackend()
+        return _BlueZCentralBackend(options: options)
 #else
         return _UnsupportedCentralBackend()
 #endif
@@ -21,7 +21,7 @@ enum _BackendFactory {
 #elseif canImport(CoreBluetooth)
         return _CoreBluetoothCentralBackend()
 #elseif os(Linux)
-        return _BlueZCentralBackend()
+        return _BlueZCentralBackend(options: options)
 #elseif os(Windows)
         return _WindowsCentralBackend()
 #else
@@ -29,7 +29,7 @@ enum _BackendFactory {
 #endif
     }
 
-    static func makePeripheral() -> any _PeripheralBackend {
+    static func makePeripheral(options: BluetoothOptions) -> any _PeripheralBackend {
 #if BLUETOOTH_BACKEND_FORCE_COREBLUETOOTH
 #if canImport(CoreBluetooth)
         return _CoreBluetoothPeripheralBackend()
@@ -38,7 +38,7 @@ enum _BackendFactory {
 #endif
 #elseif BLUETOOTH_BACKEND_FORCE_BLUEZ
 #if os(Linux)
-        return _BlueZPeripheralBackend()
+        return _BlueZPeripheralBackend(options: options)
 #else
         return _UnsupportedPeripheralBackend()
 #endif
@@ -51,7 +51,7 @@ enum _BackendFactory {
 #elseif canImport(CoreBluetooth)
         return _CoreBluetoothPeripheralBackend()
 #elseif os(Linux)
-        return _BlueZPeripheralBackend()
+        return _BlueZPeripheralBackend(options: options)
 #elseif os(Windows)
         return _WindowsPeripheralBackend()
 #else

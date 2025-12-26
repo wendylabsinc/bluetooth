@@ -2,7 +2,7 @@
 
 This package exposes a cross-platform BLE API (`CentralManager`, `PeripheralManager`, `PeripheralConnection`) and hides platform-specific details behind internal backend protocols.
 
-Backends are selected at runtime via `_BackendFactory` using conditional compilation, with optional SwiftPM **traits** to force a specific backend.
+Backends are selected at runtime via `_BackendFactory` using conditional compilation, with optional SwiftPM **traits** to force a specific backend. `CentralManager` / `PeripheralManager` pass `BluetoothOptions` (for example adapter selection) into `_BackendFactory`.
 
 ## Where Things Live
 
@@ -10,6 +10,7 @@ Backends are selected at runtime via `_BackendFactory` using conditional compila
   - `Sources/Bluetooth/CentralManager.swift`
   - `Sources/Bluetooth/PeripheralManager.swift`
   - `Sources/Bluetooth/PeripheralConnection.swift`
+  - `Sources/Bluetooth/BluetoothOptions.swift`
 - Backend protocols + factory
   - `Sources/Bluetooth/Internal/Backends/BackendProtocols.swift`
   - `Sources/Bluetooth/Internal/Backends/BackendFactory.swift`
@@ -145,6 +146,11 @@ Typical mappings:
   - `LEAdvertisingManager1`, `GattManager1`
 - L2CAP LE CoC is often best implemented with Linux `AF_BLUETOOTH` sockets (kernel APIs), with D-Bus used for higher-level device management.
 
+Adapter selection:
+
+- `BluetoothOptions(adapter: BluetoothAdapter("hci1"))`
+- or `BLUETOOTH_BLUEZ_ADAPTER=hci1` environment variable
+
 ### Windows
 
 Guard the backend file with:
@@ -169,4 +175,3 @@ Typical mappings:
 2. Implement one or more of `_CentralBackend`, `_PeripheralBackend`, `_PeripheralConnectionBackend` as `actor`s.
 3. Add selection logic in `Sources/Bluetooth/Internal/Backends/BackendFactory.swift` (and optionally a new package trait + `SwiftSetting.define` in `Package.swift`).
 4. Keep the public API stable; add new capabilities behind existing methods, returning `BluetoothError.notSupported` where appropriate.
-

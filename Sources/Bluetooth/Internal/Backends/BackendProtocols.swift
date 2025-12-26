@@ -8,6 +8,8 @@ protocol _CentralBackend: Actor {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
     func stopScan() async throws
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error>
+    func removeBond(for peripheral: Peripheral) async throws
 
     func scan(
         filter: ScanFilter?,
@@ -24,6 +26,7 @@ protocol _PeripheralBackend: Actor {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
     func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error>
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error>
 
     func startAdvertising(
         advertisingData: AdvertisementData,
@@ -38,8 +41,10 @@ protocol _PeripheralBackend: Actor {
     func stopAdvertisingSet(_ id: AdvertisingSetID) async
 
     func disconnect(_ central: Central) async throws
+    func removeBond(for central: Central) async throws
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration
+    func removeService(_ registration: GATTServiceRegistration) async throws
 
     func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error>
     func updateValue(_ value: Data, for characteristic: GATTCharacteristic, type: GATTServerUpdateType) async throws
@@ -53,6 +58,8 @@ protocol _PeripheralConnectionBackend: Actor {
     func stateUpdates() -> AsyncStream<PeripheralConnectionState>
     var mtu: Int { get }
     func mtuUpdates() -> AsyncStream<Int>
+    var pairingState: PairingState { get }
+    func pairingStateUpdates() -> AsyncStream<PairingState>
 
     func disconnect() async
 
@@ -93,4 +100,7 @@ protocol _PeripheralConnectionBackend: Actor {
         psm: L2CAPPSM,
         parameters: L2CAPChannelParameters
     ) async throws -> any L2CAPChannel
+
+    func updateConnectionParameters(_ parameters: ConnectionParameters) async throws
+    func updatePHY(_ preference: PHYPreference) async throws
 }

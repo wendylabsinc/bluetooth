@@ -18,6 +18,15 @@ actor _UnsupportedCentralBackend: _CentralBackend {
         throw BluetoothError.backendUnavailable
     }
 
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        throw BluetoothError.backendUnavailable
+    }
+
+    func removeBond(for peripheral: Peripheral) async throws {
+        _ = peripheral
+        throw BluetoothError.backendUnavailable
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -51,6 +60,10 @@ actor _UnsupportedPeripheralBackend: _PeripheralBackend {
         throw BluetoothError.backendUnavailable
     }
 
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        throw BluetoothError.backendUnavailable
+    }
+
     func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
         _ = advertisingData
         _ = scanResponseData
@@ -81,8 +94,18 @@ actor _UnsupportedPeripheralBackend: _PeripheralBackend {
         throw BluetoothError.backendUnavailable
     }
 
+    func removeBond(for central: Central) async throws {
+        _ = central
+        throw BluetoothError.backendUnavailable
+    }
+
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
         _ = service
+        throw BluetoothError.backendUnavailable
+    }
+
+    func removeService(_ registration: GATTServiceRegistration) async throws {
+        _ = registration
         throw BluetoothError.backendUnavailable
     }
 

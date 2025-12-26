@@ -88,10 +88,26 @@ public actor PeripheralConnection {
         await backend.mtuUpdates()
     }
 
+    public func pairingState() async -> PairingState {
+        await backend.pairingState
+    }
+
+    public func pairingStateUpdates() async -> AsyncStream<PairingState> {
+        await backend.pairingStateUpdates()
+    }
+
     public func openL2CAPChannel(
         psm: L2CAPPSM,
         parameters: L2CAPChannelParameters = .init()
     ) async throws -> any L2CAPChannel {
         try await backend.openL2CAPChannel(psm: psm, parameters: parameters)
+    }
+
+    public func updateConnectionParameters(_ parameters: ConnectionParameters) async throws {
+        try await backend.updateConnectionParameters(parameters)
+    }
+
+    public func updatePHY(_ preference: PHYPreference) async throws {
+        try await backend.updatePHY(preference)
     }
 }

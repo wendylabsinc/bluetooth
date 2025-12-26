@@ -129,6 +129,35 @@ public struct GATTExecuteWriteRequest: Sendable {
     }
 }
 
+public enum GATTAuthorizationTarget: Sendable, Hashable {
+    case characteristic(GATTCharacteristic)
+    case descriptor(GATTDescriptor)
+}
+
+public enum GATTAuthorizationType: Sendable, Hashable {
+    case read
+    case write
+}
+
+public struct GATTAuthorizationRequest: Sendable {
+    public var central: Central?
+    public var target: GATTAuthorizationTarget
+    public var type: GATTAuthorizationType
+    public var respond: @Sendable (Bool) async -> Void
+
+    public init(
+        central: Central?,
+        target: GATTAuthorizationTarget,
+        type: GATTAuthorizationType,
+        respond: @escaping @Sendable (Bool) async -> Void
+    ) {
+        self.central = central
+        self.target = target
+        self.type = type
+        self.respond = respond
+    }
+}
+
 public struct GATTSubscription: Hashable, Sendable {
     public var central: Central?
     public var characteristic: GATTCharacteristic
@@ -151,6 +180,7 @@ public enum GATTServerRequest: Sendable {
     case readDescriptor(GATTDescriptorReadRequest)
     case writeDescriptor(GATTDescriptorWriteRequest)
     case executeWrite(GATTExecuteWriteRequest)
+    case authorize(GATTAuthorizationRequest)
     case subscribe(GATTSubscription)
     case unsubscribe(GATTSubscription)
 }

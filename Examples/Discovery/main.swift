@@ -36,6 +36,9 @@ struct DiscoveryExample: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable BlueZ backend verbose logging.")
     var verbose: Bool = false
 
+    @Option(name: .long, help: "Bluetooth adapter (e.g. hci0).")
+    var adapter: String?
+
     mutating func run() async throws {
         if verbose {
             setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
@@ -52,7 +55,8 @@ struct DiscoveryExample: AsyncParsableCommand {
             ? ScanFilter(serviceUUIDs: uuids, namePrefix: namePrefix)
             : nil
 
-        let manager = CentralManager()
+        let options = BluetoothOptions(adapter: adapter.map(BluetoothAdapter.init))
+        let manager = CentralManager(options: options)
         let parameters = ScanParameters(allowDuplicates: duplicates)
 
         print("Starting BLE scan...")

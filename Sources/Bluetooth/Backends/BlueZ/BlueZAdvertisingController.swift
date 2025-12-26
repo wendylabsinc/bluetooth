@@ -14,8 +14,11 @@ import Glibc
 #endif
 
 actor _BlueZAdvertisingController {
-    private let adapterPath = "/org/bluez/hci0"
+    private let adapterPath: String
     private let bluezBusName = "org.bluez"
+    private let registerTimeoutNanos: UInt64 = 10 * 1_000_000_000
+    private let registerRetryDelayNanos: UInt64 = 500 * 1_000_000
+    private let registerMaxAttempts = 3
 
     private var isAdvertising = false
     private var stopRequested = false
@@ -23,6 +26,10 @@ actor _BlueZAdvertisingController {
     private var startContinuation: CheckedContinuation<Void, Error>?
     private var task: Task<Void, Never>?
     private var activePath: String?
+
+    init(adapterPath: String) {
+        self.adapterPath = adapterPath
+    }
 
     func startAdvertising(
         advertisingData: AdvertisementData,
@@ -88,7 +95,7 @@ actor _BlueZAdvertisingController {
                 if config.verbose {
                     print("[bluez] Registering advertisement at \(config.path)")
                 }
-                try await self.registerAdvertisement(connection, path: config.path)
+                try await self.registerAdvertisement(connection, path: config.path, verbose: config.verbose)
                 if config.verbose {
                     print("[bluez] Advertisement registered")
                 }
@@ -97,7 +104,7 @@ actor _BlueZAdvertisingController {
                 if config.verbose {
                     print("[bluez] Unregistering advertisement")
                 }
-                try await self.unregisterAdvertisement(connection, path: config.path)
+                try await self.unregisterAdvertisement(connection, path: config.path, verbose: config.verbose)
                 await server.unexport(path: config.path)
             }
         } catch {
@@ -124,8 +131,91 @@ actor _BlueZAdvertisingController {
         return DBusObjectServer.ExportedObject(path: config.path, interfaces: [iface])
     }
 
-    private func registerAdvertisement(_ connection: DBusClient.Connection, path: String) async throws {
-        let request = DBusRequest.createMethodCall(
+    private func registerAdvertisement(
+        _ connection: DBusClient.Connection,
+        path: String,
+        verbose: Bool
+    ) async throws {
+        var lastError: Error?
+        for attempt in 1...registerMaxAttempts {
+            do {
+                let request = makeRegisterRequest(path: path)
+                let reply = try await sendWithTimeout(
+                    connection,
+                    request: request,
+                    timeoutNanos: registerTimeoutNanos,
+                    action: "RegisterAdvertisement"
+                )
+
+                if let reply, reply.messageType == .error {
+                    let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+                    throw BluetoothError.invalidState("D-Bus RegisterAdvertisement failed: \(name)")
+                }
+                return
+            } catch {
+                lastError = error
+                if attempt < registerMaxAttempts {
+                    if verbose {
+                        print("[bluez] RegisterAdvertisement attempt \(attempt) failed: \(error)")
+                        print("[bluez] Retrying RegisterAdvertisement...")
+                    }
+                    try await Task.sleep(nanoseconds: registerRetryDelayNanos)
+                }
+            }
+        }
+
+        throw lastError ?? BluetoothError.invalidState("D-Bus RegisterAdvertisement failed")
+    }
+
+    private func unregisterAdvertisement(
+        _ connection: DBusClient.Connection,
+        path: String,
+        verbose: Bool
+    ) async throws {
+        let request = makeUnregisterRequest(path: path)
+        let reply = try await sendWithTimeout(
+            connection,
+            request: request,
+            timeoutNanos: registerTimeoutNanos,
+            action: "UnregisterAdvertisement"
+        )
+
+        guard let reply else { return }
+        if reply.messageType == .error {
+            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            if name == "org.bluez.Error.DoesNotExist" {
+                return
+            }
+            if verbose {
+                print("[bluez] UnregisterAdvertisement error: \(name)")
+            }
+            throw BluetoothError.invalidState("D-Bus UnregisterAdvertisement failed: \(name)")
+        }
+    }
+
+    private func sendWithTimeout(
+        _ connection: DBusClient.Connection,
+        request: DBusRequest,
+        timeoutNanos: UInt64,
+        action: String
+    ) async throws -> DBusMessage? {
+        try await withThrowingTaskGroup(of: DBusMessage?.self) { group in
+            group.addTask {
+                try await connection.send(request)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanos)
+                throw BluetoothError.invalidState("D-Bus \(action) timed out")
+            }
+
+            let result = try await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private func makeRegisterRequest(path: String) -> DBusRequest {
+        DBusRequest.createMethodCall(
             destination: bluezBusName,
             path: adapterPath,
             interface: "org.bluez.LEAdvertisingManager1",
@@ -135,16 +225,10 @@ actor _BlueZAdvertisingController {
                 .dictionary([:]),
             ]
         )
-
-        guard let reply = try await connection.send(request) else { return }
-        if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-            throw BluetoothError.invalidState("D-Bus RegisterAdvertisement failed: \(name)")
-        }
     }
 
-    private func unregisterAdvertisement(_ connection: DBusClient.Connection, path: String) async throws {
-        let request = DBusRequest.createMethodCall(
+    private func makeUnregisterRequest(path: String) -> DBusRequest {
+        DBusRequest.createMethodCall(
             destination: bluezBusName,
             path: adapterPath,
             interface: "org.bluez.LEAdvertisingManager1",
@@ -153,15 +237,6 @@ actor _BlueZAdvertisingController {
                 .objectPath(path)
             ]
         )
-
-        guard let reply = try await connection.send(request) else { return }
-        if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-            if name == "org.bluez.Error.DoesNotExist" {
-                return
-            }
-            throw BluetoothError.invalidState("D-Bus UnregisterAdvertisement failed: \(name)")
-        }
     }
 
     private func handleRelease() async {

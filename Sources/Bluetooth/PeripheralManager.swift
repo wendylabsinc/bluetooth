@@ -7,8 +7,8 @@ import Foundation
 public actor PeripheralManager {
     private let backend: any _PeripheralBackend
 
-    public init() {
-        self.backend = _BackendFactory.makePeripheral()
+    public init(options: BluetoothOptions = .init()) {
+        self.backend = _BackendFactory.makePeripheral(options: options)
     }
 
     init(backend: any _PeripheralBackend) {
@@ -25,6 +25,10 @@ public actor PeripheralManager {
 
     public func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
         try await backend.connectionEvents()
+    }
+
+    public func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        try await backend.pairingRequests()
     }
 
     public func startAdvertising(
@@ -66,8 +70,16 @@ public actor PeripheralManager {
         try await backend.disconnect(central)
     }
 
+    public func removeBond(for central: Central) async throws {
+        try await backend.removeBond(for: central)
+    }
+
     public func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
         try await backend.addService(service)
+    }
+
+    public func removeService(_ registration: GATTServiceRegistration) async throws {
+        try await backend.removeService(registration)
     }
 
     public func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {

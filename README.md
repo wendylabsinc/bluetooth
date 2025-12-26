@@ -12,7 +12,7 @@ Cross-platform Bluetooth Low Energy (BLE) Swift package.
 
 **Targets**
 - Apple platforms: CoreBluetooth backend (iOS 26, macOS 26, tvOS 26, watchOS 26, visionOS 26)
-- Linux: BlueZ backend (advertising + discovery + central connection implemented; GATT/L2CAP pending)
+- Linux: BlueZ backend (advertising + discovery + central connection + GATT client + GATT server registration/requests/update + L2CAP CoC)
 - Windows: Windows backend (planned)
 
 This repository currently contains **API and project layout scaffolding** for:
@@ -94,7 +94,7 @@ struct Demo {
 }
 ```
 
-GATT server (API shape; backend support pending on Linux/Windows):
+GATT server (Linux BlueZ backend supported; other backends pending):
 
 ```swift
 import Bluetooth
@@ -127,7 +127,9 @@ for try await request in requests {
 }
 ```
 
-L2CAP server (API shape; backend support pending on Linux/Windows):
+Use `removeService(_:)` to unregister a service when you no longer need it.
+
+L2CAP server (Linux BlueZ backend supported; Windows pending):
 
 ```swift
 import Bluetooth
@@ -140,6 +142,22 @@ for try await channel in incoming {
     for try await data in channel.incoming() {
         try await channel.send(data) // echo
     }
+}
+```
+
+L2CAP client (Linux BlueZ backend supported):
+
+```swift
+import Bluetooth
+
+let manager = CentralManager()
+let peripheral = Peripheral(id: .address(BluetoothAddress("AA:BB:CC:DD:EE:FF")))
+let connection = try await manager.connect(to: peripheral)
+let channel = try await connection.openL2CAPChannel(psm: L2CAPPSM(rawValue: 0x0080))
+
+try await channel.send(Data("hello".utf8))
+for try await data in channel.incoming() {
+    print("Received: \(data)")
 }
 ```
 
@@ -157,16 +175,28 @@ Run the discovery example:
 swift run BluetoothDiscoveryExample --time 10000 --verbose
 ```
 
-Run the GATT example (requires backend support for GATT server):
+Run the GATT example (Linux BlueZ backend supported):
 
 ```bash
 swift run BluetoothGATTExample --verbose
 ```
 
-Run the L2CAP example (requires backend support for L2CAP):
+Run the L2CAP example (Linux BlueZ backend supported):
 
 ```bash
 swift run BluetoothL2CAPExample --verbose
+```
+
+Run the L2CAP client example (requires a known address + PSM):
+
+```bash
+swift run BluetoothL2CAPClientExample --address AA:BB:CC:DD:EE:FF --psm 0x0080 --verbose
+```
+
+Run the central pairing example (Linux BlueZ backend supported):
+
+```bash
+swift run BluetoothCentralPairingExample --address AA:BB:CC:DD:EE:FF --verbose
 ```
 
 Optional flags:
@@ -176,4 +206,93 @@ Optional flags:
 - `--uuid <uuid>` to filter discovery by a service UUID (repeatable)
 - `--name-prefix <prefix>` to filter discovery by local name prefix
 - `--duplicates` to allow duplicate discovery results
+- `--adapter <name>` to select a BlueZ adapter (for example `hci1`)
 - `--verbose` to show BlueZ output
+
+## Adapter Selection (Linux BlueZ)
+
+Select a specific adapter by name:
+
+```swift
+let options = BluetoothOptions(adapter: BluetoothAdapter("hci1"))
+let central = CentralManager(options: options)
+let peripheral = PeripheralManager(options: options)
+```
+
+Or use an environment variable:
+
+```bash
+export BLUETOOTH_BLUEZ_ADAPTER=hci1
+```
+
+## Pairing (Linux BlueZ)
+
+The Linux backend uses a BlueZ Agent to handle pairing and authorization prompts.
+You can configure the agent using environment variables:
+
+- `BLUETOOTH_BLUEZ_AGENT_CAPABILITY` (default `NoInputNoOutput`)
+  - Supported values: `DisplayOnly`, `DisplayYesNo`, `KeyboardOnly`, `NoInputNoOutput`, `KeyboardDisplay`, `External`
+- `BLUETOOTH_BLUEZ_AGENT_PIN` (string PIN to return for `RequestPinCode`)
+- `BLUETOOTH_BLUEZ_AGENT_PASSKEY` (numeric passkey for `RequestPasskey`)
+- `BLUETOOTH_BLUEZ_AGENT_AUTO_ACCEPT` (default `true`; set to `false` to reject confirmations/authorizations)
+
+Example:
+
+```bash
+export BLUETOOTH_BLUEZ_AGENT_CAPABILITY=DisplayYesNo
+export BLUETOOTH_BLUEZ_AGENT_AUTO_ACCEPT=false
+swift run BluetoothGATTExample --verbose
+```
+
+Programmatic pairing handling (peripheral + central roles):
+
+- Peripheral role: `PeripheralManager().pairingRequests()`
+- Central role: `CentralManager().pairingRequests()`
+- Requests include `central` or `peripheral` depending on the local role.
+
+```swift
+let manager = PeripheralManager()
+let requests = try await manager.pairingRequests()
+
+Task {
+    for try await request in requests {
+        switch request {
+        case .confirmation(let confirmation):
+            await confirmation.respond(true)
+        case .authorization(let authorization):
+            await authorization.respond(true)
+        case .serviceAuthorization(let service):
+            await service.respond(true)
+        case .pinCode(let pin):
+            await pin.respond("0000")
+        case .passkey(let passkey):
+            await passkey.respond(123456)
+        case .displayPinCode(let display):
+            print("PIN: \(display.pinCode)")
+        case .displayPasskey(let display):
+            print("Passkey: \(display.passkey)")
+        }
+    }
+}
+```
+
+Remove bonding (Linux BlueZ):
+
+```swift
+let centralManager = CentralManager()
+try await centralManager.removeBond(for: peripheral)
+
+let peripheralManager = PeripheralManager()
+try await peripheralManager.removeBond(for: central)
+```
+
+## Connection Tuning (API Surface)
+
+The API includes connection parameter + PHY update calls, but Linux BlueZ support is not yet implemented:
+
+```swift
+try await connection.updateConnectionParameters(
+    ConnectionParameters(minIntervalMs: 15, maxIntervalMs: 30, latency: 0, supervisionTimeoutMs: 2000)
+)
+try await connection.updatePHY(PHYPreference(tx: .le2M, rx: .le2M))
+```

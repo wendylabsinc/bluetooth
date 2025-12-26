@@ -28,12 +28,16 @@ struct L2CAPExample: AsyncParsableCommand {
     @Flag(name: .long, help: "Enable BlueZ backend verbose logging.")
     var verbose: Bool = false
 
+    @Option(name: .long, help: "Bluetooth adapter (e.g. hci0).")
+    var adapter: String?
+
     mutating func run() async throws {
         if verbose {
             setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
         }
 
-        let manager = PeripheralManager()
+        let options = BluetoothOptions(adapter: adapter.map(BluetoothAdapter.init))
+        let manager = PeripheralManager(options: options)
         let parameters = AdvertisingParameters(isConnectable: connectable, isScannable: connectable)
 
         if !connectable {

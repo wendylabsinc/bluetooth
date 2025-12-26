@@ -14,7 +14,7 @@ import Glibc
 #endif
 
 actor _BlueZScanController {
-    private let adapterPath = "/org/bluez/hci0"
+    private let adapterPath: String
     private let bluezBusName = "org.bluez"
     private let objectManagerPath = "/"
 
@@ -28,6 +28,10 @@ actor _BlueZScanController {
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var stopRequested = false
     private var scanTask: Task<Void, Never>?
+
+    init(adapterPath: String) {
+        self.adapterPath = adapterPath
+    }
 
     func startScan(
         filter: ScanFilter?,
@@ -216,6 +220,7 @@ actor _BlueZScanController {
 
         for (pathValue, interfacesValue) in objects {
             guard case .objectPath(let path) = pathValue else { continue }
+            guard isAdapterDevicePath(path) else { continue }
             guard case .dictionary(let interfaces) = interfacesValue else { continue }
             if let props = properties(for: "org.bluez.Device1", in: interfaces) {
                 updateDevice(path: path, properties: props)
@@ -231,6 +236,7 @@ actor _BlueZScanController {
         case ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded"):
             guard message.body.count >= 2 else { return }
             guard case .objectPath(let path) = message.body[0] else { return }
+            guard isAdapterDevicePath(path) else { return }
             guard case .dictionary(let interfaces) = message.body[1] else { return }
             if let props = properties(for: "org.bluez.Device1", in: interfaces) {
                 updateDevice(path: path, properties: props)
@@ -238,6 +244,7 @@ actor _BlueZScanController {
         case ("org.freedesktop.DBus.ObjectManager", "InterfacesRemoved"):
             guard message.body.count >= 2 else { return }
             guard case .objectPath(let path) = message.body[0] else { return }
+            guard isAdapterDevicePath(path) else { return }
             guard case .array(let values) = message.body[1] else { return }
             if values.contains(where: { value in
                 if case .string(let name) = value {
@@ -251,7 +258,8 @@ actor _BlueZScanController {
             guard message.body.count >= 2 else { return }
             guard case .string(let iface) = message.body[0], iface == "org.bluez.Device1" else { return }
             guard case .dictionary(let props) = message.body[1] else { return }
-            let path = message.path ?? ""
+            guard let path = message.path else { return }
+            guard isAdapterDevicePath(path) else { return }
             updateDevice(path: path, properties: props)
         default:
             return
@@ -271,6 +279,7 @@ actor _BlueZScanController {
     }
 
     private func updateDevice(path: String, properties: [DBusValue: DBusValue]) {
+        guard isAdapterDevicePath(path) else { return }
         var address = devicePathMap[path] ?? addressFromPath(path)
         var state: DeviceState? = nil
 
@@ -343,10 +352,15 @@ actor _BlueZScanController {
     }
 
     private func removeDevice(path: String) {
+        guard isAdapterDevicePath(path) else { return }
         guard let address = devicePathMap[path] else { return }
         devices[address] = nil
         emitted.remove(address)
         devicePathMap[path] = nil
+    }
+
+    private func isAdapterDevicePath(_ path: String) -> Bool {
+        path.hasPrefix("\(adapterPath)/dev_")
     }
 
     private func ensureState(address: String?) -> DeviceState? {

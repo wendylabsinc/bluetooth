@@ -9,8 +9,8 @@ public struct ConnectionOptions: Hashable, Sendable, Codable {
 public actor CentralManager {
     private let backend: any _CentralBackend
 
-    public init() {
-        self.backend = _BackendFactory.makeCentral()
+    public init(options: BluetoothOptions = .init()) {
+        self.backend = _BackendFactory.makeCentral(options: options)
     }
 
     init(backend: any _CentralBackend) {
@@ -34,6 +34,14 @@ public actor CentralManager {
 
     public func stopScan() async throws {
         try await backend.stopScan()
+    }
+
+    public func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        try await backend.pairingRequests()
+    }
+
+    public func removeBond(for peripheral: Peripheral) async throws {
+        try await backend.removeBond(for: peripheral)
     }
 
     public func connect(

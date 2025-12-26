@@ -31,8 +31,16 @@ let package = Package(
             targets: ["BluetoothL2CAPExample"]
         ),
         .executable(
+            name: "BluetoothL2CAPClientExample",
+            targets: ["BluetoothL2CAPClientExample"]
+        ),
+        .executable(
             name: "BluetoothDiscoveryExample",
             targets: ["BluetoothDiscoveryExample"]
+        ),
+        .executable(
+            name: "BluetoothCentralPairingExample",
+            targets: ["BluetoothCentralPairingExample"]
         ),
     ],
     traits: [
@@ -112,12 +120,34 @@ let package = Package(
             ]
         ),
         .executableTarget(
+            name: "BluetoothL2CAPClientExample",
+            dependencies: [
+                "Bluetooth",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Examples/L2CAPClient",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
             name: "BluetoothDiscoveryExample",
             dependencies: [
                 "Bluetooth",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Examples/Discovery",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
+            name: "BluetoothCentralPairingExample",
+            dependencies: [
+                "Bluetooth",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Examples/CentralPairing",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

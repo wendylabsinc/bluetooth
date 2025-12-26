@@ -19,6 +19,15 @@ actor _WindowsCentralBackend: _CentralBackend {
         throw BluetoothError.unimplemented("Windows stopScan backend")
     }
 
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        throw BluetoothError.unimplemented("Windows pairing requests backend")
+    }
+
+    func removeBond(for peripheral: Peripheral) async throws {
+        _ = peripheral
+        throw BluetoothError.unimplemented("Windows removeBond backend")
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -52,6 +61,10 @@ actor _WindowsPeripheralBackend: _PeripheralBackend {
         throw BluetoothError.unimplemented("Windows peripheral connection events backend")
     }
 
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        throw BluetoothError.unimplemented("Windows pairing requests backend")
+    }
+
     func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
         _ = advertisingData
         _ = scanResponseData
@@ -82,9 +95,19 @@ actor _WindowsPeripheralBackend: _PeripheralBackend {
         throw BluetoothError.unimplemented("Windows peripheral disconnect backend")
     }
 
+    func removeBond(for central: Central) async throws {
+        _ = central
+        throw BluetoothError.unimplemented("Windows removeBond backend")
+    }
+
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
         _ = service
         throw BluetoothError.unimplemented("Windows GATT server backend")
+    }
+
+    func removeService(_ registration: GATTServiceRegistration) async throws {
+        _ = registration
+        throw BluetoothError.unimplemented("Windows GATT removeService backend")
     }
 
     func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {

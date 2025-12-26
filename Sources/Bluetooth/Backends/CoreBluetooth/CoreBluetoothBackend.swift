@@ -20,6 +20,15 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
         throw BluetoothError.unimplemented("CoreBluetooth stopScan backend")
     }
 
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        throw BluetoothError.unimplemented("CoreBluetooth pairing requests backend")
+    }
+
+    func removeBond(for peripheral: Peripheral) async throws {
+        _ = peripheral
+        throw BluetoothError.unimplemented("CoreBluetooth removeBond backend")
+    }
+
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
@@ -53,6 +62,10 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         throw BluetoothError.unimplemented("CoreBluetooth peripheral connection events backend")
     }
 
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        throw BluetoothError.unimplemented("CoreBluetooth pairing requests backend")
+    }
+
     func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
         _ = advertisingData
         _ = scanResponseData
@@ -83,9 +96,19 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         throw BluetoothError.unimplemented("CoreBluetooth peripheral disconnect backend")
     }
 
+    func removeBond(for central: Central) async throws {
+        _ = central
+        throw BluetoothError.unimplemented("CoreBluetooth removeBond backend")
+    }
+
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
         _ = service
         throw BluetoothError.unimplemented("CoreBluetooth GATT server backend")
+    }
+
+    func removeService(_ registration: GATTServiceRegistration) async throws {
+        _ = registration
+        throw BluetoothError.unimplemented("CoreBluetooth GATT removeService backend")
     }
 
     func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {
