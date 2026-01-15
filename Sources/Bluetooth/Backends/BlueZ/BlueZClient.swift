@@ -30,6 +30,7 @@ actor BlueZClient {
     private var messageHandlers: [UUID: @Sendable (DBusMessage) async -> Void] = [:]
     private var isConnecting = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var messageContinuation: AsyncStream<DBusMessage>.Continuation?
 
     init() {
         logger.trace("BlueZClient initialized")
@@ -59,9 +60,17 @@ actor BlueZClient {
 
         // Start a long-running task that keeps the connection alive
         connectionTask = Task {
-            try await DBusClient.withConnection(to: address, auth: auth) { conn in
-                await self.setConnection(conn)
-                await self.waitForShutdown()
+            do {
+                try await DBusClient.withConnection(to: address, auth: auth) { conn in
+                    await self.setConnection(conn)
+                    await self.waitForShutdown()
+                }
+                self.logger.warning("D-Bus withConnection returned normally (unexpected)")
+            } catch {
+                self.logger.error("D-Bus connection failed", metadata: [
+                    "error": "\(error)",
+                    "errorType": "\(type(of: error))"
+                ])
             }
         }
 
@@ -129,19 +138,59 @@ actor BlueZClient {
 
     private func setConnection(_ conn: DBusClient.Connection) async {
         connection = conn
-        objectServer = DBusObjectServer(connection: conn)
+        // Create the object server but DON'T let it set its own message handler
+        // We'll route messages to it ourselves to avoid overwriting
+        let server = DBusObjectServer(connection: conn, logger: logger)
+        objectServer = server
         isConnecting = false
 
-        await conn.setMessageHandler { [weak self] message in
-            await self?.handleMessage(message)
+        // Create an AsyncStream to receive messages
+        let (stream, continuation) = AsyncStream<DBusMessage>.makeStream()
+        messageContinuation = continuation
+
+        // Set a simple message handler that yields to the stream (no weak captures)
+        await conn.setMessageHandler { [logger] message in
+            logger.debug("BlueZClient received D-Bus message", metadata: [
+                "type": "\(message.messageType)",
+                "path": "\(message.path ?? "nil")",
+                "interface": "\(message.interface ?? "nil")",
+                "member": "\(message.member ?? "nil")"
+            ])
+            continuation.yield(message)
         }
 
         logger.info("D-Bus connection established")
 
-        if let continuation = connectionContinuation {
+        if let connContinuation = connectionContinuation {
             connectionContinuation = nil
-            continuation.resume(returning: conn)
+            connContinuation.resume(returning: conn)
         }
+
+        // Run the message handling loop
+        logger.debug("Starting message handling loop...")
+        await run(stream: stream, server: server)
+        logger.warning("Message handling loop exited (unexpected)")
+    }
+
+    /// Message handling loop that processes incoming D-Bus messages.
+    private func run(stream: AsyncStream<DBusMessage>, server: DBusObjectServer) async {
+        logger.debug("BlueZClient run loop started")
+        for await message in stream {
+            logger.debug("BlueZClient processing message from stream", metadata: [
+                "type": "\(message.messageType)",
+                "path": "\(message.path ?? "nil")",
+                "member": "\(message.member ?? "nil")"
+            ])
+            // First, let the object server handle method calls (Introspect, GetAll, etc.)
+            // This is critical for RegisterAdvertisement to work - BlueZ needs to introspect
+            // the advertisement object before responding
+            await server.handle(message: message)
+            logger.trace("BlueZClient finished server.handle")
+
+            // Then let any registered handlers also see the message (for signals, etc.)
+            await handleMessage(message)
+        }
+        logger.debug("BlueZClient run loop ended")
     }
 
     private func waitForShutdown() async {
@@ -165,6 +214,10 @@ actor BlueZClient {
         objectServer = nil
         messageHandlers.removeAll()
         isConnecting = false
+
+        // Finish the message stream to stop the run loop
+        messageContinuation?.finish()
+        messageContinuation = nil
 
         if let continuation = stopContinuation {
             stopContinuation = nil
