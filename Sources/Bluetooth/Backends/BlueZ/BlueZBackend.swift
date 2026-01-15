@@ -10,6 +10,8 @@ import NIOCore
 
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 actor _BlueZCentralBackend: _CentralBackend {

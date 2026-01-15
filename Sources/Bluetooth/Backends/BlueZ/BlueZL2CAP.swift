@@ -8,6 +8,16 @@ import Foundation
 
 #if canImport(Glibc)
 import Glibc
+private let system_close = Glibc.close
+private let system_connect = Glibc.connect
+private let system_bind = Glibc.bind
+private let system_send = Glibc.send
+#elseif canImport(Musl)
+import Musl
+private let system_close = Musl.close
+private let system_connect = Musl.connect
+private let system_bind = Musl.bind
+private let system_send = Musl.send
 #endif
 
 enum BlueZAddressType: UInt8, Sendable {
@@ -177,9 +187,14 @@ enum BlueZL2CAP {
     }
 
     private static func createSocket() throws -> Int32 {
+        #if canImport(Glibc)
+        let socketType = Int32(SOCK_SEQPACKET.rawValue)
+        #elseif canImport(Musl)
+        let socketType = SOCK_SEQPACKET
+        #endif
         let fd = socket(
             BlueZL2CAPConstants.afBluetooth,
-            Int32(SOCK_SEQPACKET.rawValue),
+            socketType,
             BlueZL2CAPConstants.btProtoL2CAP
         )
         if fd < 0 {
@@ -200,8 +215,8 @@ enum BlueZL2CAP {
             addressType: addressType
         )
         let result = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Glibc.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_l2>.size))
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                system_connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_l2>.size))
             }
         }
         if result != 0 {
@@ -226,7 +241,7 @@ enum BlueZL2CAP {
 
         let bindResult = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Glibc.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_l2>.size))
+                system_bind(fd, $0, socklen_t(MemoryLayout<sockaddr_l2>.size))
             }
         }
         if bindResult != 0 {
@@ -349,7 +364,7 @@ enum BlueZL2CAP {
 
     private static func closeSocket(_ fd: Int32) {
         _ = shutdown(fd, Int32(SHUT_RDWR))
-        _ = Glibc.close(fd)
+        _ = system_close(fd)
     }
 
     fileprivate static func systemError(
@@ -395,7 +410,7 @@ final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
             Task.detached {
                 let result = payload.withUnsafeBytes { buffer in
                     guard let base = buffer.baseAddress else { return 0 }
-                    return Glibc.send(fd, base, buffer.count, Int32(MSG_NOSIGNAL))
+                    return system_send(fd, base, buffer.count, Int32(MSG_NOSIGNAL))
                 }
                 if result < 0 {
                     let err = errno
@@ -465,7 +480,7 @@ final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
         guard shouldClose else { return }
 
         _ = shutdown(fd, Int32(SHUT_RDWR))
-        _ = Glibc.close(fd)
+        _ = system_close(fd)
         let task = withLock { () -> Task<Void, Never>? in
             let task = incomingTask
             incomingTask = nil

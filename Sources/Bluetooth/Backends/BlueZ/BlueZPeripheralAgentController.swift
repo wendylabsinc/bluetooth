@@ -11,6 +11,8 @@ import NIOCore
 
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 enum _BlueZAgentControllerShared {

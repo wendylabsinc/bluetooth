@@ -4,7 +4,11 @@ import Dispatch
 import Foundation
 
 #if os(Linux)
+#if canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 #elseif os(Windows)
 // Windows doesn't provide Darwin/Glibc.
 #else
