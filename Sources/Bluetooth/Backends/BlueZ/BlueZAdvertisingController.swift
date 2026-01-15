@@ -7,6 +7,7 @@ import Foundation
 #endif
 
 import DBUS
+import Logging
 import NIOCore
 
 #if canImport(Glibc)
@@ -16,8 +17,8 @@ import Musl
 #endif
 
 actor _BlueZAdvertisingController {
+    private let client: BlueZClient
     private let adapterPath: String
-    private let bluezBusName = "org.bluez"
     private let registerTimeoutNanos: UInt64 = 10 * 1_000_000_000
     private let registerRetryDelayNanos: UInt64 = 500 * 1_000_000
     private let registerMaxAttempts = 3
@@ -29,7 +30,17 @@ actor _BlueZAdvertisingController {
     private var task: Task<Void, Never>?
     private var activePath: String?
 
-    init(adapterPath: String) {
+    private var logger: Logger {
+        var logger = BluetoothLogger.advertising
+        logger[metadataKey: BluetoothLogMetadata.adapterPath] = "\(adapterPath)"
+        if let activePath {
+            logger[metadataKey: BluetoothLogMetadata.advertisementPath] = "\(activePath)"
+        }
+        return logger
+    }
+
+    init(client: BlueZClient, adapterPath: String) {
+        self.client = client
         self.adapterPath = adapterPath
     }
 
@@ -39,23 +50,28 @@ actor _BlueZAdvertisingController {
         parameters: AdvertisingParameters
     ) async throws {
         if isAdvertising {
+            logger.warning("Advertising already in progress, rejecting new request")
             throw BluetoothError.invalidState("BlueZ advertising already in progress")
         }
 
-        let verbose = ProcessInfo.processInfo.environment["BLUETOOTH_BLUEZ_VERBOSE"] == "1"
-        let merged = merge(advertisingData: advertisingData, scanResponseData: scanResponseData, verbose: verbose)
+        let merged = merge(advertisingData: advertisingData, scanResponseData: scanResponseData)
         let path = makeAdvertisementPath()
         activePath = path
         isAdvertising = true
         stopRequested = false
+
+        logger.info("Starting advertising", metadata: [
+            BluetoothLogMetadata.advertisementPath: "\(path)",
+            "type": "\(parameters.isConnectable ? "peripheral" : "broadcast")",
+            "includeTxPower": "\(parameters.includeTxPower)"
+        ])
 
         let config = AdvertisementConfig(
             path: path,
             type: parameters.isConnectable ? "peripheral" : "broadcast",
             includeTxPower: parameters.includeTxPower,
             data: merged,
-            parameters: parameters,
-            verbose: verbose
+            parameters: parameters
         )
 
         try await withCheckedThrowingContinuation { continuation in
@@ -86,30 +102,29 @@ actor _BlueZAdvertisingController {
 
     private func runDbusAdvertising(_ config: AdvertisementConfig) async {
         do {
-            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-            let auth = AuthType.external(userID: String(getuid()))
+            let connection = try await client.getConnection()
+            let server = try await client.getObjectServer()
 
             let object = makeAdvertisementObject(config: config)
-            try await DBusClient.withConnection(to: address, auth: auth) { connection in
-                let server = DBusObjectServer(connection: connection)
-                await server.export(object)
+            await server.export(object)
 
-                if config.verbose {
-                    print("[bluez] Registering advertisement at \(config.path)")
-                }
-                try await self.registerAdvertisement(connection, path: config.path, verbose: config.verbose)
-                if config.verbose {
-                    print("[bluez] Advertisement registered")
-                }
-                await self.resumeStartIfNeeded()
-                await self.waitForStop()
-                if config.verbose {
-                    print("[bluez] Unregistering advertisement")
-                }
-                try await self.unregisterAdvertisement(connection, path: config.path, verbose: config.verbose)
-                await server.unexport(path: config.path)
-            }
+            logger.debug("Registering advertisement via D-Bus", metadata: [
+                BluetoothLogMetadata.advertisementPath: "\(config.path)"
+            ])
+            try await registerAdvertisement(connection, path: config.path)
+            logger.info("Advertisement registered successfully")
+
+            await resumeStartIfNeeded()
+            await waitForStop()
+
+            logger.debug("Unregistering advertisement")
+            try await unregisterAdvertisement(connection, path: config.path)
+            await server.unexport(path: config.path)
+            logger.info("Advertisement stopped")
         } catch {
+            logger.error("Advertising failed", metadata: [
+                BluetoothLogMetadata.error: "\(error)"
+            ])
             resumeStartIfNeeded(error: error)
         }
 
@@ -135,8 +150,7 @@ actor _BlueZAdvertisingController {
 
     private func registerAdvertisement(
         _ connection: DBusClient.Connection,
-        path: String,
-        verbose: Bool
+        path: String
     ) async throws {
         var lastError: Error?
         for attempt in 1...registerMaxAttempts {
@@ -150,29 +164,36 @@ actor _BlueZAdvertisingController {
                 )
 
                 if let reply, reply.messageType == .error {
-                    let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+                    let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
                     throw BluetoothError.invalidState("D-Bus RegisterAdvertisement failed: \(name)")
                 }
+                logger.trace("RegisterAdvertisement succeeded", metadata: [
+                    BluetoothLogMetadata.attempt: "\(attempt)"
+                ])
                 return
             } catch {
                 lastError = error
                 if attempt < registerMaxAttempts {
-                    if verbose {
-                        print("[bluez] RegisterAdvertisement attempt \(attempt) failed: \(error)")
-                        print("[bluez] Retrying RegisterAdvertisement...")
-                    }
+                    logger.warning("RegisterAdvertisement attempt failed, retrying", metadata: [
+                        BluetoothLogMetadata.attempt: "\(attempt)",
+                        BluetoothLogMetadata.maxAttempts: "\(registerMaxAttempts)",
+                        BluetoothLogMetadata.error: "\(error)"
+                    ])
                     try await Task.sleep(nanoseconds: registerRetryDelayNanos)
                 }
             }
         }
 
+        logger.error("RegisterAdvertisement failed after all attempts", metadata: [
+            BluetoothLogMetadata.maxAttempts: "\(registerMaxAttempts)",
+            BluetoothLogMetadata.error: "\(lastError.map { "\($0)" } ?? "unknown")"
+        ])
         throw lastError ?? BluetoothError.invalidState("D-Bus RegisterAdvertisement failed")
     }
 
     private func unregisterAdvertisement(
         _ connection: DBusClient.Connection,
-        path: String,
-        verbose: Bool
+        path: String
     ) async throws {
         let request = makeUnregisterRequest(path: path)
         let reply = try await sendWithTimeout(
@@ -184,13 +205,14 @@ actor _BlueZAdvertisingController {
 
         guard let reply else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name == "org.bluez.Error.DoesNotExist" {
+                logger.debug("Advertisement already unregistered (DoesNotExist)")
                 return
             }
-            if verbose {
-                print("[bluez] UnregisterAdvertisement error: \(name)")
-            }
+            logger.error("UnregisterAdvertisement failed", metadata: [
+                BluetoothLogMetadata.error: "\(name)"
+            ])
             throw BluetoothError.invalidState("D-Bus UnregisterAdvertisement failed: \(name)")
         }
     }
@@ -218,7 +240,7 @@ actor _BlueZAdvertisingController {
 
     private func makeRegisterRequest(path: String) -> DBusRequest {
         DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.LEAdvertisingManager1",
             method: "RegisterAdvertisement",
@@ -231,7 +253,7 @@ actor _BlueZAdvertisingController {
 
     private func makeUnregisterRequest(path: String) -> DBusRequest {
         DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.LEAdvertisingManager1",
             method: "UnregisterAdvertisement",
@@ -308,16 +330,14 @@ actor _BlueZAdvertisingController {
             properties.append(.init(name: "IncludeTxPower", value: .boolean(true)))
         }
 
-        if config.verbose {
-            if config.parameters.interval != nil {
-                print("[bluez] Advertising interval is not configurable via D-Bus backend yet.")
-            }
-            if config.parameters.primaryPHY != nil || config.parameters.secondaryPHY != nil {
-                print("[bluez] PHY selection is not configurable via D-Bus backend yet.")
-            }
-            if config.parameters.isExtended {
-                print("[bluez] Extended advertising is not configurable via D-Bus backend yet.")
-            }
+        if config.parameters.interval != nil {
+            logger.notice("Advertising interval is not configurable via D-Bus backend")
+        }
+        if config.parameters.primaryPHY != nil || config.parameters.secondaryPHY != nil {
+            logger.notice("PHY selection is not configurable via D-Bus backend")
+        }
+        if config.parameters.isExtended {
+            logger.notice("Extended advertising is not configurable via D-Bus backend")
         }
 
         return properties
@@ -325,8 +345,7 @@ actor _BlueZAdvertisingController {
 
     private func merge(
         advertisingData: AdvertisementData,
-        scanResponseData: AdvertisementData?,
-        verbose: Bool
+        scanResponseData: AdvertisementData?
     ) -> AdvertisementData {
         guard let scanResponseData else { return advertisingData }
 
@@ -346,8 +365,8 @@ actor _BlueZAdvertisingController {
 
         if let manufacturer = scanResponseData.manufacturerData, merged.manufacturerData == nil {
             merged.manufacturerData = manufacturer
-        } else if scanResponseData.manufacturerData != nil, merged.manufacturerData != nil, verbose {
-            print("[bluez] scanResponseData manufacturer data ignored (already set in advertising data).")
+        } else if scanResponseData.manufacturerData != nil, merged.manufacturerData != nil {
+            logger.debug("scanResponseData manufacturer data ignored (already set in advertising data)")
         }
 
         if !scanResponseData.serviceData.isEmpty {
@@ -355,8 +374,10 @@ actor _BlueZAdvertisingController {
             for (uuid, data) in scanResponseData.serviceData {
                 if combined[uuid] == nil {
                     combined[uuid] = data
-                } else if verbose {
-                    print("[bluez] scanResponseData service data for \(uuid) ignored (already set).")
+                } else {
+                    logger.debug("scanResponseData service data ignored (already set)", metadata: [
+                        BluetoothLogMetadata.serviceUUID: "\(uuid)"
+                    ])
                 }
             }
             merged.serviceData = combined
@@ -368,16 +389,6 @@ actor _BlueZAdvertisingController {
     private func makeAdvertisementPath() -> String {
         let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         return "/org/wendylabsinc/bluetooth/advertisement\(suffix)"
-    }
-
-    private func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
     }
 
     private func cleanup() {
@@ -396,7 +407,6 @@ actor _BlueZAdvertisingController {
         let includeTxPower: Bool
         let data: AdvertisementData
         let parameters: AdvertisingParameters
-        let verbose: Bool
     }
 }
 

@@ -7,6 +7,7 @@ import Foundation
 #endif
 
 import DBUS
+import Logging
 import NIOCore
 
 #if canImport(Glibc)
@@ -15,14 +16,8 @@ import Glibc
 import Musl
 #endif
 
-enum _BlueZAgentControllerShared {
-    static let shared = _BlueZPeripheralAgentController(
-        verbose: ProcessInfo.processInfo.environment["BLUETOOTH_BLUEZ_VERBOSE"] == "1"
-    )
-}
-
 actor _BlueZPeripheralAgentController {
-    private let bluezBusName = "org.bluez"
+    private let client: BlueZClient
     private let managerPath = "/org/bluez"
 
     private enum PeerRole {
@@ -42,8 +37,13 @@ actor _BlueZPeripheralAgentController {
 
     private let agentPath: String
     private let config: AgentConfig
-    private let verbose: Bool
     private let requestTimeoutNanos: UInt64 = 30 * 1_000_000_000
+
+    private var logger: Logger {
+        var logger = BluetoothLogger.pairing
+        logger[metadataKey: BluetoothLogMetadata.agentPath] = "\(agentPath)"
+        return logger
+    }
 
     private var task: Task<Void, Never>?
     private var stopRequested = false
@@ -53,10 +53,11 @@ actor _BlueZPeripheralAgentController {
     private var pairingContinuation: AsyncThrowingStream<PairingRequest, Error>.Continuation?
     private var pendingResponses: [UUID: PendingResponse] = [:]
     private var deviceRoles: [String: PeerRole] = [:]
+    private var messageHandlerID: UUID?
 
-    init(verbose: Bool) {
-        self.verbose = verbose
-        self.config = AgentConfig.load(verbose: verbose)
+    init(client: BlueZClient) {
+        self.client = client
+        self.config = AgentConfig.load()
         self.agentPath = AgentConfig.makeAgentPath()
     }
 
@@ -110,19 +111,17 @@ actor _BlueZPeripheralAgentController {
 
     private func run() async {
         do {
-            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-            let auth = AuthType.external(userID: String(getuid()))
+            let connection = try await client.getConnection()
 
-            try await DBusClient.withConnection(to: address, auth: auth) { connection in
-                await connection.setMessageHandler { [weak self] message in
-                    await self?.handleMessage(message, connection: connection)
-                }
-
-                try await self.registerAgent(connection)
-                await self.resumeStartIfNeeded()
-                await self.waitForStop()
-                await self.unregisterAgent(connection)
+            let handlerID = client.addMessageHandler { [weak self] message in
+                await self?.handleMessage(message, connection: connection)
             }
+            messageHandlerID = handlerID
+
+            try await registerAgent(connection)
+            resumeStartIfNeeded()
+            await waitForStop()
+            await unregisterAgent(connection)
         } catch {
             resumeStartIfNeeded(error: error)
         }
@@ -187,8 +186,11 @@ actor _BlueZPeripheralAgentController {
                 )
                 continuation.yield(.displayPinCode(display))
             }
-            if verbose, let device = message.body.first?.objectPath {
-                print("[bluez] DisplayPinCode for \(device): \(code)")
+            if let device = message.body.first?.objectPath {
+                logger.info("DisplayPinCode request", metadata: [
+                    BluetoothLogMetadata.devicePath: "\(device)",
+                    "pinCode": "\(code)"
+                ])
             }
         }
         await sendReply(message, connection: connection)
@@ -218,8 +220,12 @@ actor _BlueZPeripheralAgentController {
                 )
                 continuation.yield(.displayPasskey(display))
             }
-            if verbose, let device = message.body.first?.objectPath {
-                print("[bluez] DisplayPasskey for \(device): \(passkeyValue)")
+            if let device = message.body.first?.objectPath {
+                logger.info("DisplayPasskey request", metadata: [
+                    BluetoothLogMetadata.devicePath: "\(device)",
+                    "passkey": "\(passkeyValue)",
+                    "entered": "\(enteredValue.map { String($0) } ?? "nil")"
+                ])
             }
         }
 
@@ -230,8 +236,11 @@ actor _BlueZPeripheralAgentController {
         let peer = peerContext(from: message)
         let passkey = message.body.dropFirst().first?.uint32 ?? 0
 
-        if verbose, let device = message.body.first?.objectPath {
-            print("[bluez] RequestConfirmation for \(device): \(passkey)")
+        if let device = message.body.first?.objectPath {
+            logger.info("RequestConfirmation", metadata: [
+                BluetoothLogMetadata.devicePath: "\(device)",
+                "passkey": "\(passkey)"
+            ])
         }
 
         let accepted = await awaitConfirmation(
@@ -240,8 +249,10 @@ actor _BlueZPeripheralAgentController {
             passkey: passkey
         )
         if accepted {
+            logger.debug("Confirmation accepted")
             await sendReply(message, connection: connection)
         } else {
+            logger.info("Confirmation rejected")
             await sendError(message, connection: connection, reason: "User confirmation rejected")
         }
     }
@@ -259,7 +270,7 @@ actor _BlueZPeripheralAgentController {
     private func handleAuthorizeService(_ message: DBusMessage, connection: DBusClient.Connection) async {
         let peer = peerContext(from: message)
         let uuidString = message.body.dropFirst().first?.string
-        let uuid = uuidString.flatMap(parseBluetoothUUID)
+        let uuid = uuidString.flatMap(client.parseBluetoothUUID)
         let accepted = await awaitServiceAuthorization(
             central: peer.central,
             peripheral: peer.peripheral,
@@ -384,12 +395,12 @@ actor _BlueZPeripheralAgentController {
     }
 
     private func registerAgent(_ connection: DBusClient.Connection) async throws {
-        if verbose {
-            print("[bluez] Registering agent at \(agentPath) (\(config.capability))")
-        }
+        logger.info("Registering agent", metadata: [
+            "capability": "\(config.capability)"
+        ])
 
         let registerRequest = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: managerPath,
             interface: "org.bluez.AgentManager1",
             method: "RegisterAgent",
@@ -400,14 +411,16 @@ actor _BlueZPeripheralAgentController {
         )
 
         if let reply = try await connection.send(registerRequest), reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name != "org.bluez.Error.AlreadyExists" {
+                logger.error("RegisterAgent failed", metadata: [BluetoothLogMetadata.error: "\(name)"])
                 throw BluetoothError.invalidState("D-Bus RegisterAgent failed: \(name)")
             }
+            logger.debug("Agent already registered")
         }
 
         let defaultRequest = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: managerPath,
             interface: "org.bluez.AgentManager1",
             method: "RequestDefaultAgent",
@@ -415,20 +428,24 @@ actor _BlueZPeripheralAgentController {
         )
 
         if let reply = try await connection.send(defaultRequest), reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name != "org.bluez.Error.AlreadyExists" {
+                logger.error("RequestDefaultAgent failed", metadata: [BluetoothLogMetadata.error: "\(name)"])
                 throw BluetoothError.invalidState("D-Bus RequestDefaultAgent failed: \(name)")
             }
         }
 
         agentRegistered = true
+        logger.info("Agent registered successfully")
     }
 
     private func unregisterAgent(_ connection: DBusClient.Connection) async {
         guard agentRegistered else { return }
 
+        logger.debug("Unregistering agent")
+
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: managerPath,
             interface: "org.bluez.AgentManager1",
             method: "UnregisterAgent",
@@ -437,15 +454,13 @@ actor _BlueZPeripheralAgentController {
 
         do {
             if let reply = try await connection.send(request), reply.messageType == .error {
-                let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-                if verbose {
-                    print("[bluez] UnregisterAgent failed: \(name)")
-                }
+                let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+                logger.warning("UnregisterAgent failed", metadata: [BluetoothLogMetadata.error: "\(name)"])
+            } else {
+                logger.info("Agent unregistered successfully")
             }
         } catch {
-            if verbose {
-                print("[bluez] UnregisterAgent failed: \(error)")
-            }
+            logger.warning("UnregisterAgent failed", metadata: [BluetoothLogMetadata.error: "\(error)"])
         }
 
         agentRegistered = false
@@ -482,6 +497,10 @@ actor _BlueZPeripheralAgentController {
         task = nil
         agentRegistered = false
         deviceRoles.removeAll()
+        if let handlerID = messageHandlerID {
+            client.removeMessageHandler(handlerID)
+            messageHandlerID = nil
+        }
         Task { await clearPairingState() }
     }
 
@@ -582,21 +601,6 @@ actor _BlueZPeripheralAgentController {
         return BluetoothAddress(addr)
     }
 
-    private func parseBluetoothUUID(_ value: String) -> BluetoothUUID? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        let noPrefix = trimmed.hasPrefix("0x") ? String(trimmed.dropFirst(2)) : trimmed
-        if noPrefix.contains("-"), let uuid = UUID(uuidString: noPrefix) {
-            return .bit128(uuid)
-        }
-        if noPrefix.count <= 4, let short = UInt16(noPrefix, radix: 16) {
-            return .bit16(short)
-        }
-        if noPrefix.count <= 8, let mid = UInt32(noPrefix, radix: 16) {
-            return .bit32(mid)
-        }
-        return nil
-    }
-
     private func sendReply(
         _ message: DBusMessage,
         connection: DBusClient.Connection,
@@ -608,9 +612,7 @@ actor _BlueZPeripheralAgentController {
                 DBusRequest.createMethodReturn(replyingTo: message, body: body)
             )
         } catch {
-            if verbose {
-                print("[bluez] Agent reply failed: \(error)")
-            }
+            logger.warning("Agent reply failed", metadata: [BluetoothLogMetadata.error: "\(error)"])
         }
     }
 
@@ -629,20 +631,8 @@ actor _BlueZPeripheralAgentController {
                 )
             )
         } catch {
-            if verbose {
-                print("[bluez] Agent error reply failed: \(error)")
-            }
+            logger.warning("Agent error reply failed", metadata: [BluetoothLogMetadata.error: "\(error)"])
         }
-    }
-
-    private func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
     }
 
     private struct AgentConfig: Sendable {
@@ -651,13 +641,17 @@ actor _BlueZPeripheralAgentController {
         let passkey: UInt32?
         let autoAccept: Bool
 
-        static func load(verbose: Bool) -> AgentConfig {
+        static func load() -> AgentConfig {
+            let logger = BluetoothLogger.pairing
             let env = ProcessInfo.processInfo.environment
             let capabilityValue = env["BLUETOOTH_BLUEZ_AGENT_CAPABILITY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let normalized = normalizeCapability(capabilityValue)
 
-            if verbose, let capabilityValue, !capabilityValue.isEmpty, normalized != capabilityValue {
-                print("[bluez] Unknown agent capability \"\(capabilityValue)\", using \(normalized)")
+            if let capabilityValue, !capabilityValue.isEmpty, normalized != capabilityValue {
+                logger.warning("Unknown agent capability, using default", metadata: [
+                    "requested": "\(capabilityValue)",
+                    "using": "\(normalized)"
+                ])
             }
 
             let pin = env["BLUETOOTH_BLUEZ_AGENT_PIN"]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -665,12 +659,19 @@ actor _BlueZPeripheralAgentController {
 
             let passkeyValue = env["BLUETOOTH_BLUEZ_AGENT_PASSKEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let passkey = passkeyValue.flatMap { UInt32($0) }
-            if verbose, passkeyValue != nil, passkey == nil {
-                print("[bluez] Invalid BLUETOOTH_BLUEZ_AGENT_PASSKEY value")
+            if passkeyValue != nil, passkey == nil {
+                logger.warning("Invalid BLUETOOTH_BLUEZ_AGENT_PASSKEY value, ignoring")
             }
 
             let autoAcceptValue = env["BLUETOOTH_BLUEZ_AGENT_AUTO_ACCEPT"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let autoAccept = autoAcceptValue.map { ["1", "true", "yes", "on"].contains($0) } ?? true
+
+            logger.debug("Agent config loaded", metadata: [
+                "capability": "\(normalized)",
+                "hasPinCode": "\(pinCode != nil)",
+                "hasPasskey": "\(passkey != nil)",
+                "autoAccept": "\(autoAccept)"
+            ])
 
             return AgentConfig(
                 capability: normalized,

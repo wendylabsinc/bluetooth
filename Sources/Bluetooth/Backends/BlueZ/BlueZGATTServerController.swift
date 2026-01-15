@@ -16,17 +16,16 @@ import Musl
 #endif
 
 actor _BlueZGATTServerController {
+    private let client: BlueZClient
     private let adapterPath: String
-    private let bluezBusName = "org.bluez"
     private let appPath = "/com/wendylabsinc/bluetooth"
 
-    private var connection: DBusClient.Connection?
-    private var objectServer: DBusObjectServer?
     private var task: Task<Void, Never>?
     private var startContinuation: CheckedContinuation<Void, Error>?
     private var stopRequested = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var isRegistered = false
+    private var isStarted = false
 
     private var requestContinuation: AsyncThrowingStream<GATTServerRequest, Error>.Continuation?
 
@@ -42,15 +41,15 @@ actor _BlueZGATTServerController {
     private var preparedWriteIDsByCentral: [String: [UUID]] = [:]
     private var pendingExecuteByCentral: Set<String> = []
 
-    init(adapterPath: String) {
+    init(client: BlueZClient, adapterPath: String) {
+        self.client = client
         self.adapterPath = adapterPath
     }
 
     func addService(_ definition: GATTServiceDefinition) async throws -> GATTServiceRegistration {
         try await ensureStarted()
-        guard let server = objectServer, let connection else {
-            throw BluetoothError.invalidState("BlueZ GATT server is not ready")
-        }
+        let server = try await client.getObjectServer()
+        let connection = try await client.getConnection()
 
         let servicePath = "\(appPath)/service\(nextServiceID)"
         let service = GATTService(uuid: definition.uuid, isPrimary: definition.isPrimary, instanceID: nextServiceID)
@@ -133,9 +132,7 @@ actor _BlueZGATTServerController {
 
     func removeService(_ registration: GATTServiceRegistration) async throws {
         try await ensureStarted()
-        guard let server = objectServer else {
-            throw BluetoothError.invalidState("BlueZ GATT server is not ready")
-        }
+        let server = try await client.getObjectServer()
 
         guard let servicePath = servicePath(for: registration.service),
               let serviceState = serviceStates[servicePath]
@@ -148,7 +145,8 @@ actor _BlueZGATTServerController {
         serviceStates[servicePath] = nil
         await server.unexport(path: servicePath)
 
-        if serviceStates.isEmpty, isRegistered, let connection {
+        if serviceStates.isEmpty, isRegistered {
+            let connection = try await client.getConnection()
             try await unregisterApplication(connection)
             isRegistered = false
         }
@@ -190,9 +188,7 @@ actor _BlueZGATTServerController {
         characteristicStates[path] = state
 
         guard shouldNotify else { return }
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ GATT server is not ready")
-        }
+        let connection = try await client.getConnection()
 
         let bytes = value.map { DBusValue.byte($0) }
         let changed: [DBusValue: DBusValue] = [
@@ -223,102 +219,14 @@ actor _BlueZGATTServerController {
     }
 
     private func ensureStarted() async throws {
-        if task != nil {
+        if isStarted {
             return
         }
 
-        try await withCheckedThrowingContinuation { continuation in
-            startContinuation = continuation
-            task = Task { [weak self] in
-                await self?.runServer()
-            }
-        }
-    }
-
-    private func runServer() async {
-        do {
-            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-            let auth = AuthType.external(userID: String(getuid()))
-
-            try await DBusClient.withConnection(to: address, auth: auth) { connection in
-                await self.setConnection(connection)
-                let server = DBusObjectServer(connection: connection)
-                await self.setObjectServer(server)
-
-                let application = await self.makeApplicationObject()
-                await server.export(application)
-
-                await self.resumeStartIfNeeded()
-                await self.waitForStop()
-
-                if await self.isRegistered {
-                    try await self.unregisterApplication(connection)
-                }
-            }
-        } catch {
-            resumeStartIfNeeded(error: error)
-            finishRequests(error: error)
-        }
-
-        cleanup()
-    }
-
-    private func setConnection(_ connection: DBusClient.Connection?) {
-        self.connection = connection
-    }
-
-    private func setObjectServer(_ server: DBusObjectServer?) {
-        self.objectServer = server
-    }
-
-    private func resumeStartIfNeeded(error: Error? = nil) {
-        guard let continuation = startContinuation else { return }
-        startContinuation = nil
-        if let error {
-            continuation.resume(throwing: error)
-        } else {
-            continuation.resume()
-        }
-    }
-
-    private func finishRequests(error: Error) {
-        requestContinuation?.finish(throwing: error)
-        requestContinuation = nil
-    }
-
-    private func cleanup() {
-        stopRequested = false
-        stopContinuation = nil
-        startContinuation = nil
-        task?.cancel()
-        task = nil
-        connection = nil
-        objectServer = nil
-        isRegistered = false
-        preparedWrites.removeAll()
-        preparedWriteIDsByCentral.removeAll()
-        pendingExecuteByCentral.removeAll()
-    }
-
-    private func waitForStop() async {
-        if stopRequested {
-            stopRequested = false
-            return
-        }
-
-        await withCheckedContinuation { continuation in
-            stopContinuation = continuation
-        }
-        stopContinuation = nil
-        stopRequested = false
-    }
-
-    private func requestStop() {
-        stopRequested = true
-        if let continuation = stopContinuation {
-            stopContinuation = nil
-            continuation.resume()
-        }
+        let server = try await client.getObjectServer()
+        let application = makeApplicationObject()
+        await server.export(application)
+        isStarted = true
     }
 
     private func makeApplicationObject() -> DBusObjectServer.ExportedObject {
@@ -345,9 +253,17 @@ actor _BlueZGATTServerController {
         requestStop()
     }
 
+    private func requestStop() {
+        stopRequested = true
+        if let continuation = stopContinuation {
+            stopContinuation = nil
+            continuation.resume()
+        }
+    }
+
     private func registerApplication(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.GattManager1",
             method: "RegisterApplication",
@@ -360,14 +276,14 @@ actor _BlueZGATTServerController {
 
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("D-Bus RegisterApplication failed: \(name)")
         }
     }
 
     private func unregisterApplication(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.GattManager1",
             method: "UnregisterApplication",
@@ -378,7 +294,7 @@ actor _BlueZGATTServerController {
 
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name == "org.bluez.Error.DoesNotExist" {
                 return
             }
@@ -690,7 +606,7 @@ actor _BlueZGATTServerController {
             throw BluetoothError.invalidState("Characteristic does not support write")
         }
 
-        guard let value, let data = dataFromValue(value) else {
+        guard let value, let data = client.dataFromValue(value) else {
             throw BluetoothError.invalidState("WriteValue payload is invalid")
         }
 
@@ -818,7 +734,7 @@ actor _BlueZGATTServerController {
             throw BluetoothError.invalidState("Descriptor does not support write")
         }
 
-        guard let value, let data = dataFromValue(value) else {
+        guard let value, let data = client.dataFromValue(value) else {
             throw BluetoothError.invalidState("WriteValue payload is invalid")
         }
 
@@ -1024,11 +940,11 @@ actor _BlueZGATTServerController {
         var result = ParsedOptions()
         for (keyValue, rawValue) in dict {
             guard case .string(let key) = keyValue else { continue }
-            let value = unwrapVariant(rawValue)
+            let value = client.unwrapVariant(rawValue)
 
             switch key {
             case "offset":
-                result.offset = parseInt(value)
+                result.offset = client.parseInt(value)
             case "device":
                 if let path = value.objectPath {
                     result.central = centralFromDevicePath(path)
@@ -1057,20 +973,6 @@ actor _BlueZGATTServerController {
         }
 
         return result
-    }
-
-    private func dataFromValue(_ value: DBusValue) -> Data? {
-        let unwrapped = unwrapVariant(value)
-        guard case .array(let values) = unwrapped else { return nil }
-        var bytes: [UInt8] = []
-        for entry in values {
-            if case .byte(let byte) = entry {
-                bytes.append(byte)
-            } else {
-                return nil
-            }
-        }
-        return Data(bytes)
     }
 
     private func applyingWrite(_ data: Data, to current: Data, offset: Int) throws -> Data {
@@ -1207,41 +1109,11 @@ actor _BlueZGATTServerController {
         }
     }
 
-    private func parseInt(_ value: DBusValue) -> Int? {
-        switch value {
-        case .int16(let v): return Int(v)
-        case .int32(let v): return Int(v)
-        case .int64(let v): return Int(v)
-        case .uint16(let v): return Int(v)
-        case .uint32(let v): return Int(v)
-        case .uint64(let v): return Int(v)
-        default:
-            return nil
-        }
-    }
-
-    private func unwrapVariant(_ value: DBusValue) -> DBusValue {
-        if case .variant(let variant) = value {
-            return variant.value
-        }
-        return value
-    }
-
     private func centralFromDevicePath(_ path: String) -> Central? {
         guard let range = path.range(of: "/dev_") else { return nil }
         let suffix = path[range.upperBound...]
         let address = suffix.replacingOccurrences(of: "_", with: ":")
         return Central(id: .address(BluetoothAddress(address)))
-    }
-
-    private func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
     }
 
     private func serviceInterfaces(_ state: ServiceState) async -> [DBusValue: DBusValue] {

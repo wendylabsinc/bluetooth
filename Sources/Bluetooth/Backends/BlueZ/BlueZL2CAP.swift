@@ -376,6 +376,10 @@ enum BlueZL2CAP {
     }
 }
 
+/// Thread-safety note: This class is @unchecked Sendable because:
+/// 1. The file descriptor (fd) is immutable after initialization
+/// 2. Mutable state (closed, incomingStream, incomingTask) is protected by NSLock
+/// 3. All public methods use the lock before accessing mutable state
 final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     let psm: L2CAPPSM
     let mtu: Int

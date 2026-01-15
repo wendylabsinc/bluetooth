@@ -16,8 +16,8 @@ import Musl
 #endif
 
 actor _BlueZScanController {
+    private let client: BlueZClient
     private let adapterPath: String
-    private let bluezBusName = "org.bluez"
     private let objectManagerPath = "/"
 
     private var isScanning = false
@@ -30,8 +30,10 @@ actor _BlueZScanController {
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var stopRequested = false
     private var scanTask: Task<Void, Never>?
+    private var messageHandlerID: UUID?
 
-    init(adapterPath: String) {
+    init(client: BlueZClient, adapterPath: String) {
+        self.client = client
         self.adapterPath = adapterPath
     }
 
@@ -103,25 +105,29 @@ actor _BlueZScanController {
         stopRequested = false
         scanTask?.cancel()
         scanTask = nil
+
+        if let handlerID = messageHandlerID {
+            client.removeMessageHandler(handlerID)
+            messageHandlerID = nil
+        }
     }
 
     private func runDbusScan(parameters: ScanParameters) async {
         do {
-            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-            let auth = AuthType.external(userID: String(getuid()))
-
-            try await DBusClient.withConnection(to: address, auth: auth) { connection in
-                await connection.setMessageHandler { [weak self] message in
-                    await self?.handleDbusMessage(message)
-                }
-
-                try await self.addMatchRules(connection)
-                try await self.setDiscoveryFilter(connection, parameters: parameters)
-                try await self.startDiscovery(connection)
-                try await self.loadManagedObjects(connection)
-                await self.waitForStop()
-                try await self.stopDiscovery(connection)
+            // Register message handler with shared client
+            let handlerID = client.addMessageHandler { [weak self] message in
+                await self?.handleDbusMessage(message)
             }
+            messageHandlerID = handlerID
+
+            let connection = try await client.getConnection()
+
+            try await addMatchRules(connection)
+            try await setDiscoveryFilter(connection, parameters: parameters)
+            try await startDiscovery(connection)
+            try await loadManagedObjects(connection)
+            await waitForStop()
+            try await stopDiscovery(connection)
 
             finish()
         } catch {
@@ -144,20 +150,13 @@ actor _BlueZScanController {
 
     private func addMatchRules(_ connection: DBusClient.Connection) async throws {
         let rules = [
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
         ]
 
         for rule in rules {
-            let request = DBusRequest.createMethodCall(
-                destination: "org.freedesktop.DBus",
-                path: "/org/freedesktop/DBus",
-                interface: "org.freedesktop.DBus",
-                method: "AddMatch",
-                body: [.string(rule)]
-            )
-            _ = try await send(connection, request: request, action: "AddMatch")
+            try await client.addMatchRule(rule)
         }
     }
 
@@ -176,7 +175,7 @@ actor _BlueZScanController {
         }
 
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.Adapter1",
             method: "SetDiscoveryFilter",
@@ -187,7 +186,7 @@ actor _BlueZScanController {
 
     private func startDiscovery(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.Adapter1",
             method: "StartDiscovery"
@@ -197,7 +196,7 @@ actor _BlueZScanController {
 
     private func stopDiscovery(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: adapterPath,
             interface: "org.bluez.Adapter1",
             method: "StopDiscovery"
@@ -207,7 +206,7 @@ actor _BlueZScanController {
 
     private func loadManagedObjects(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: objectManagerPath,
             interface: "org.freedesktop.DBus.ObjectManager",
             method: "GetManagedObjects"
@@ -287,7 +286,7 @@ actor _BlueZScanController {
 
         for (keyValue, rawValue) in properties {
             guard case .string(let key) = keyValue else { continue }
-            let value = unwrapVariant(rawValue)
+            let value = client.unwrapVariant(rawValue)
 
             switch key {
             case "Address":
@@ -306,12 +305,12 @@ actor _BlueZScanController {
                     updateName(&state, name: name)
                 }
             case "RSSI":
-                if let rssi = parseInt(value) {
+                if let rssi = client.parseInt(value) {
                     state = ensureState(address: address)
                     state?.rssi = rssi
                 }
             case "TxPower":
-                if let tx = parseInt(value) {
+                if let tx = client.parseInt(value) {
                     state = ensureState(address: address)
                     state?.advertisementData.txPowerLevel = tx
                 }
@@ -319,7 +318,7 @@ actor _BlueZScanController {
                 if case .array(let values) = value {
                     let uuids = values.compactMap { entry -> BluetoothUUID? in
                         guard case .string(let uuid) = entry else { return nil }
-                        return parseBluetoothUUID(uuid)
+                        return client.parseBluetoothUUID(uuid)
                     }
                     state = ensureState(address: address)
                     state?.advertisementData.serviceUUIDs = uuids
@@ -394,8 +393,8 @@ actor _BlueZScanController {
     private func parseManufacturerData(_ dict: [DBusValue: DBusValue]) -> ManufacturerData? {
         for (key, value) in dict {
             guard case .uint16(let company) = key else { continue }
-            let payload = unwrapVariant(value)
-            if let data = dataFromValue(payload) {
+            let payload = client.unwrapVariant(value)
+            if let data = client.dataFromValue(payload) {
                 return ManufacturerData(companyIdentifier: company, data: data)
             }
         }
@@ -406,9 +405,9 @@ actor _BlueZScanController {
         var result: [BluetoothUUID: Data] = [:]
         for (key, value) in dict {
             guard case .string(let uuidString) = key else { continue }
-            guard let uuid = parseBluetoothUUID(uuidString) else { continue }
-            let payload = unwrapVariant(value)
-            if let data = dataFromValue(payload) {
+            guard let uuid = client.parseBluetoothUUID(uuidString) else { continue }
+            let payload = client.unwrapVariant(value)
+            if let data = client.dataFromValue(payload) {
                 result[uuid] = data
             }
         }
@@ -452,69 +451,10 @@ actor _BlueZScanController {
         let reply = try await connection.send(request)
         guard let reply else { return nil }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("D-Bus \(action) failed: \(name)")
         }
         return reply
-    }
-
-    private func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
-    }
-
-
-    private func parseInt(_ value: DBusValue) -> Int? {
-        switch value {
-        case .int16(let v): return Int(v)
-        case .int32(let v): return Int(v)
-        case .int64(let v): return Int(v)
-        case .uint16(let v): return Int(v)
-        case .uint32(let v): return Int(v)
-        case .uint64(let v): return Int(v)
-        default:
-            return nil
-        }
-    }
-
-    private func unwrapVariant(_ value: DBusValue) -> DBusValue {
-        if case .variant(let variant) = value {
-            return variant.value
-        }
-        return value
-    }
-
-    private func dataFromValue(_ value: DBusValue) -> Data? {
-        guard case .array(let values) = value else { return nil }
-        var bytes: [UInt8] = []
-        for entry in values {
-            if case .byte(let byte) = entry {
-                bytes.append(byte)
-            } else {
-                return nil
-            }
-        }
-        return Data(bytes)
-    }
-
-    private func parseBluetoothUUID(_ value: String) -> BluetoothUUID? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        let noPrefix = trimmed.hasPrefix("0x") ? String(trimmed.dropFirst(2)) : trimmed
-        if noPrefix.contains("-"), let uuid = UUID(uuidString: noPrefix) {
-            return .bit128(uuid)
-        }
-        if noPrefix.count <= 4, let short = UInt16(noPrefix, radix: 16) {
-            return .bit16(short)
-        }
-        if noPrefix.count <= 8, let mid = UInt32(noPrefix, radix: 16) {
-            return .bit32(mid)
-        }
-        return nil
     }
 
     private func addressFromPath(_ path: String) -> String? {

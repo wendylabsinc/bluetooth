@@ -6,6 +6,7 @@ import Foundation
 #endif
 
 import DBUS
+import Logging
 import NIOCore
 
 #if canImport(Glibc)
@@ -14,16 +15,30 @@ import Glibc
 import Musl
 #endif
 
-actor _BlueZCentralBackend: _CentralBackend {
-    private let scanController: _BlueZScanController
-    private let adapterPath: String
+struct _BlueZCentralBackend: _CentralBackend {
+    let client: BlueZClient
+    let scanController: _BlueZScanController
+    let adapterPath: String
+    let agentController: _BlueZPeripheralAgentController
+
+    private var logger: Logger {
+        var logger = BluetoothLogger.backend
+        logger[metadataKey: BluetoothLogMetadata.adapterPath] = "\(adapterPath)"
+        return logger
+    }
 
     init(options: BluetoothOptions) {
         let selection = BlueZAdapterSelection(options: options)
+        let client = BlueZClient()
+        self.client = client
         self.adapterPath = selection.path
-        self.scanController = _BlueZScanController(adapterPath: selection.path)
+        self.scanController = _BlueZScanController(client: client, adapterPath: selection.path)
+        self.agentController = _BlueZPeripheralAgentController(client: client)
+
+        BluetoothLogger.backend.info("BlueZ central backend initialized", metadata: [
+            BluetoothLogMetadata.adapterPath: "\(selection.path)"
+        ])
     }
-    private let agentController = _BlueZAgentControllerShared.shared
 
     var state: BluetoothState { .unknown }
 
@@ -62,6 +77,7 @@ actor _BlueZCentralBackend: _CentralBackend {
         options: ConnectionOptions
     ) async throws -> any _PeripheralConnectionBackend {
         let backend = try _BlueZPeripheralConnectionBackend(
+            client: client,
             peripheral: peripheral,
             options: options,
             agentController: agentController,
@@ -79,60 +95,86 @@ actor _BlueZCentralBackend: _CentralBackend {
 
     private func removeDevice(address: String) async throws {
         let devicePath = "\(adapterPath)/dev_" + address.uppercased().replacingOccurrences(of: ":", with: "_")
-        let socket = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-        let auth = AuthType.external(userID: String(getuid()))
-        let adapterPath = self.adapterPath
 
-        try await DBusClient.withConnection(to: socket, auth: auth) { connection in
-            let request = DBusRequest.createMethodCall(
-                destination: "org.bluez",
-                path: adapterPath,
-                interface: "org.bluez.Adapter1",
-                method: "RemoveDevice",
-                body: [.objectPath(devicePath)]
-            )
+        let request = DBusRequest.createMethodCall(
+            destination: client.busName,
+            path: adapterPath,
+            interface: "org.bluez.Adapter1",
+            method: "RemoveDevice",
+            body: [.objectPath(devicePath)]
+        )
 
-            guard let reply = try await connection.send(request) else { return }
-            if reply.messageType == .error {
-                let name = Self.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-                if name == "org.bluez.Error.DoesNotExist" {
-                    return
-                }
-                throw BluetoothError.invalidState("D-Bus RemoveDevice failed: \(name)")
+        guard let reply = try await client.send(request) else { return }
+        if reply.messageType == .error {
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            if name == "org.bluez.Error.DoesNotExist" {
+                return
             }
+            throw BluetoothError.invalidState("D-Bus RemoveDevice failed: \(name)")
         }
-    }
-
-    private static func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
     }
 }
 
-actor _BlueZPeripheralBackend: _PeripheralBackend {
-    private let advertisingController: _BlueZAdvertisingController
-    private let connectionEventsController: _BlueZPeripheralConnectionEventsController
-    private let gattServerController: _BlueZGATTServerController
-    private let agentController = _BlueZAgentControllerShared.shared
-    private struct L2CAPListenerState {
+private actor _BlueZL2CAPListenerManager {
+    private struct ListenerState {
         var listener: BlueZL2CAP.Listener
         var isAccepting: Bool
     }
 
-    private let adapterPath: String
-    private var l2capListeners: [L2CAPPSM: L2CAPListenerState] = [:]
+    private var listeners: [L2CAPPSM: ListenerState] = [:]
+
+    func publish(parameters: L2CAPChannelParameters) throws -> L2CAPPSM {
+        let listener = try BlueZL2CAP.createListener(parameters: parameters)
+        listeners[listener.psm] = ListenerState(listener: listener, isAccepting: false)
+        return listener.psm
+    }
+
+    func startAccepting(psm: L2CAPPSM) throws -> BlueZL2CAP.Listener {
+        guard var state = listeners[psm] else {
+            throw BluetoothError.invalidState("No L2CAP listener published for PSM 0x\(String(psm.rawValue, radix: 16))")
+        }
+        if state.isAccepting {
+            throw BluetoothError.invalidState("L2CAP incoming stream already active for PSM 0x\(String(psm.rawValue, radix: 16))")
+        }
+        state.isAccepting = true
+        listeners[psm] = state
+        return state.listener
+    }
+
+    func stop(psm: L2CAPPSM) {
+        guard let state = listeners.removeValue(forKey: psm) else { return }
+        BlueZL2CAP.closeListener(state.listener)
+    }
+}
+
+struct _BlueZPeripheralBackend: _PeripheralBackend {
+    let client: BlueZClient
+    let advertisingController: _BlueZAdvertisingController
+    let connectionEventsController: _BlueZPeripheralConnectionEventsController
+    let gattServerController: _BlueZGATTServerController
+    let agentController: _BlueZPeripheralAgentController
+    let adapterPath: String
+    private let l2capManager = _BlueZL2CAPListenerManager()
+
+    private var logger: Logger {
+        var logger = BluetoothLogger.backend
+        logger[metadataKey: BluetoothLogMetadata.adapterPath] = "\(adapterPath)"
+        return logger
+    }
 
     init(options: BluetoothOptions) {
         let selection = BlueZAdapterSelection(options: options)
+        let client = BlueZClient()
+        self.client = client
         self.adapterPath = selection.path
-        self.advertisingController = _BlueZAdvertisingController(adapterPath: selection.path)
-        self.connectionEventsController = _BlueZPeripheralConnectionEventsController(adapterPath: selection.path)
-        self.gattServerController = _BlueZGATTServerController(adapterPath: selection.path)
+        self.advertisingController = _BlueZAdvertisingController(client: client, adapterPath: selection.path)
+        self.connectionEventsController = _BlueZPeripheralConnectionEventsController(client: client, adapterPath: selection.path)
+        self.gattServerController = _BlueZGATTServerController(client: client, adapterPath: selection.path)
+        self.agentController = _BlueZPeripheralAgentController(client: client)
+
+        BluetoothLogger.backend.info("BlueZ peripheral backend initialized", metadata: [
+            BluetoothLogMetadata.adapterPath: "\(selection.path)"
+        ])
     }
 
     var state: BluetoothState { .unknown }
@@ -187,25 +229,21 @@ actor _BlueZPeripheralBackend: _PeripheralBackend {
         }
 
         let devicePath = "\(adapterPath)/dev_" + address.uppercased().replacingOccurrences(of: ":", with: "_")
-        let socket = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-        let auth = AuthType.external(userID: String(getuid()))
 
-        try await DBusClient.withConnection(to: socket, auth: auth) { connection in
-            let request = DBusRequest.createMethodCall(
-                destination: "org.bluez",
-                path: devicePath,
-                interface: "org.bluez.Device1",
-                method: "Disconnect"
-            )
+        let request = DBusRequest.createMethodCall(
+            destination: client.busName,
+            path: devicePath,
+            interface: "org.bluez.Device1",
+            method: "Disconnect"
+        )
 
-            guard let reply = try await connection.send(request) else { return }
-            if reply.messageType == .error {
-                let name = Self.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-                if name == "org.bluez.Error.DoesNotExist" {
-                    return
-                }
-                throw BluetoothError.invalidState("D-Bus Disconnect failed: \(name)")
+        guard let reply = try await client.send(request) else { return }
+        if reply.messageType == .error {
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            if name == "org.bluez.Error.DoesNotExist" {
+                return
             }
+            throw BluetoothError.invalidState("D-Bus Disconnect failed: \(name)")
         }
     }
 
@@ -215,27 +253,22 @@ actor _BlueZPeripheralBackend: _PeripheralBackend {
         }
 
         let devicePath = "\(adapterPath)/dev_" + address.uppercased().replacingOccurrences(of: ":", with: "_")
-        let socket = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-        let auth = AuthType.external(userID: String(getuid()))
-        let adapterPath = self.adapterPath
 
-        try await DBusClient.withConnection(to: socket, auth: auth) { connection in
-            let request = DBusRequest.createMethodCall(
-                destination: "org.bluez",
-                path: adapterPath,
-                interface: "org.bluez.Adapter1",
-                method: "RemoveDevice",
-                body: [.objectPath(devicePath)]
-            )
+        let request = DBusRequest.createMethodCall(
+            destination: client.busName,
+            path: adapterPath,
+            interface: "org.bluez.Adapter1",
+            method: "RemoveDevice",
+            body: [.objectPath(devicePath)]
+        )
 
-            guard let reply = try await connection.send(request) else { return }
-            if reply.messageType == .error {
-                let name = Self.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-                if name == "org.bluez.Error.DoesNotExist" {
-                    return
-                }
-                throw BluetoothError.invalidState("D-Bus RemoveDevice failed: \(name)")
+        guard let reply = try await client.send(request) else { return }
+        if reply.messageType == .error {
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            if name == "org.bluez.Error.DoesNotExist" {
+                return
             }
+            throw BluetoothError.invalidState("D-Bus RemoveDevice failed: \(name)")
         }
     }
 
@@ -258,26 +291,14 @@ actor _BlueZPeripheralBackend: _PeripheralBackend {
     }
 
     func publishL2CAPChannel(parameters: L2CAPChannelParameters) async throws -> L2CAPPSM {
-        let listener = try BlueZL2CAP.createListener(parameters: parameters)
-        l2capListeners[listener.psm] = L2CAPListenerState(listener: listener, isAccepting: false)
-        return listener.psm
+        try await l2capManager.publish(parameters: parameters)
     }
 
     func incomingL2CAPChannels(psm: L2CAPPSM) async throws -> AsyncThrowingStream<any L2CAPChannel, Error> {
-        guard var state = l2capListeners[psm] else {
-            throw BluetoothError.invalidState("No L2CAP listener published for PSM 0x\(String(psm.rawValue, radix: 16))")
-        }
-        if state.isAccepting {
-            throw BluetoothError.invalidState("L2CAP incoming stream already active for PSM 0x\(String(psm.rawValue, radix: 16))")
-        }
-
-        state.isAccepting = true
-        l2capListeners[psm] = state
-
-        let listener = state.listener
+        let listener = try await l2capManager.startAccepting(psm: psm)
         return AsyncThrowingStream { continuation in
-            continuation.onTermination = { [weak self] _ in
-                Task { await self?.stopL2CAPListener(psm: psm) }
+            continuation.onTermination = { _ in
+                Task { await l2capManager.stop(psm: psm) }
             }
             Task.detached {
                 BlueZL2CAP.acceptLoop(listener: listener, continuation: continuation)
@@ -285,25 +306,10 @@ actor _BlueZPeripheralBackend: _PeripheralBackend {
         }
     }
 
-    private func stopL2CAPListener(psm: L2CAPPSM) {
-        guard let state = l2capListeners.removeValue(forKey: psm) else { return }
-        BlueZL2CAP.closeListener(state.listener)
-    }
-
     private static func extractAddress(from central: Central) -> String? {
         let raw = central.id.rawValue
         guard raw.hasPrefix("addr:") else { return nil }
         return String(raw.dropFirst("addr:".count))
-    }
-
-    private static func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
     }
 }
 

@@ -5,7 +5,7 @@ import FoundationEssentials
 import Foundation
 #endif
 
-actor _WindowsCentralBackend: _CentralBackend {
+struct _WindowsCentralBackend: _CentralBackend {
     var state: BluetoothState { .unknown }
 
     func stateUpdates() -> AsyncStream<BluetoothState> {
@@ -47,7 +47,7 @@ actor _WindowsCentralBackend: _CentralBackend {
     }
 }
 
-actor _WindowsPeripheralBackend: _PeripheralBackend {
+struct _WindowsPeripheralBackend: _PeripheralBackend {
     var state: BluetoothState { .unknown }
 
     func stateUpdates() -> AsyncStream<BluetoothState> {

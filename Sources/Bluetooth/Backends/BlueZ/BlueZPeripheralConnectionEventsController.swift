@@ -16,7 +16,7 @@ import Musl
 #endif
 
 actor _BlueZPeripheralConnectionEventsController {
-    private let bluezBusName = "org.bluez"
+    private let client: BlueZClient
     private let objectManagerPath = "/"
     private let adapterPath: String
 
@@ -27,8 +27,10 @@ actor _BlueZPeripheralConnectionEventsController {
     private var task: Task<Void, Never>?
     private var deviceStates: [String: DeviceState] = [:]
     private var devicePathMap: [String: String] = [:]
+    private var messageHandlerID: UUID?
 
-    init(adapterPath: String) {
+    init(client: BlueZClient, adapterPath: String) {
+        self.client = client
         self.adapterPath = adapterPath
     }
 
@@ -80,22 +82,24 @@ actor _BlueZPeripheralConnectionEventsController {
         task = nil
         deviceStates.removeAll()
         devicePathMap.removeAll()
+        if let handlerID = messageHandlerID {
+            client.removeMessageHandler(handlerID)
+            messageHandlerID = nil
+        }
     }
 
     private func runDbusEvents() async {
         do {
-            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-            let auth = AuthType.external(userID: String(getuid()))
+            let connection = try await client.getConnection()
 
-            try await DBusClient.withConnection(to: address, auth: auth) { connection in
-                await connection.setMessageHandler { [weak self] message in
-                    await self?.handleMessage(message)
-                }
-
-                try await self.addMatchRules(connection)
-                try await self.loadManagedObjects(connection)
-                await self.waitForStop()
+            let handlerID = client.addMessageHandler { [weak self] message in
+                await self?.handleMessage(message)
             }
+            messageHandlerID = handlerID
+
+            try await addMatchRules(connection)
+            try await loadManagedObjects(connection)
+            await waitForStop()
 
             finish()
         } catch {
@@ -105,26 +109,19 @@ actor _BlueZPeripheralConnectionEventsController {
 
     private func addMatchRules(_ connection: DBusClient.Connection) async throws {
         let rules = [
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.bluez.Device1'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesRemoved'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.bluez.Device1'",
         ]
 
         for rule in rules {
-            let request = DBusRequest.createMethodCall(
-                destination: "org.freedesktop.DBus",
-                path: "/org/freedesktop/DBus",
-                interface: "org.freedesktop.DBus",
-                method: "AddMatch",
-                body: [.string(rule)]
-            )
-            _ = try await connection.send(request)
+            try await client.addMatchRule(rule)
         }
     }
 
     private func loadManagedObjects(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: objectManagerPath,
             interface: "org.freedesktop.DBus.ObjectManager",
             method: "GetManagedObjects"
@@ -199,7 +196,7 @@ actor _BlueZPeripheralConnectionEventsController {
 
         for (keyValue, rawValue) in properties {
             guard case .string(let key) = keyValue else { continue }
-            let value = unwrapVariant(rawValue)
+            let value = client.unwrapVariant(rawValue)
 
             switch key {
             case "Address":
@@ -298,13 +295,6 @@ actor _BlueZPeripheralConnectionEventsController {
             return props
         }
         return nil
-    }
-
-    private func unwrapVariant(_ value: DBusValue) -> DBusValue {
-        if case .variant(let variant) = value {
-            return variant.value
-        }
-        return value
     }
 
     private func sanitizeName(_ name: String) -> String? {

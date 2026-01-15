@@ -16,7 +16,7 @@ import Musl
 #endif
 
 actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
-    private let bluezBusName = "org.bluez"
+    private let client: BlueZClient
     private let adapterPath: String
     private let devicePath: String
     private let deviceAddress: String
@@ -44,19 +44,21 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     private var mtuContinuations: [UUID: AsyncStream<Int>.Continuation] = [:]
     private var pairingStateContinuations: [UUID: AsyncStream<PairingState>.Continuation] = [:]
 
-    private var connection: DBusClient.Connection?
     private var task: Task<Void, Never>?
     private var stopRequested = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
     private var connectContinuation: CheckedContinuation<Void, Error>?
     private var agentRegistered = false
+    private var messageHandlerID: UUID?
 
     init(
+        client: BlueZClient,
         peripheral: Peripheral,
         options: ConnectionOptions,
         agentController: _BlueZPeripheralAgentController? = nil,
         adapterPath: String
     ) throws {
+        self.client = client
         guard let address = Self.extractAddress(from: peripheral) else {
             throw BluetoothError.invalidState("BlueZ requires a peripheral address on Linux")
         }
@@ -139,9 +141,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     func discoverServices(_ uuids: [BluetoothUUID]?) async throws -> [GATTService] {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         await waitForServicesResolved()
         let cache = try await loadGattObjects(connection)
@@ -158,9 +158,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         _ uuids: [BluetoothUUID]?,
         for service: GATTService
     ) async throws -> [GATTCharacteristic] {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         await waitForServicesResolved()
         let cache = try await loadGattObjects(connection)
@@ -179,13 +177,11 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     func readValue(for characteristic: GATTCharacteristic) async throws -> Data {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let path = try await resolveCharacteristicPath(characteristic, connection: connection)
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: path,
             interface: "org.bluez.GattCharacteristic1",
             method: "ReadValue",
@@ -199,7 +195,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             throw BluetoothError.invalidState("BlueZ ReadValue failed")
         }
 
-        guard let value = reply.body.first, let data = dataFromValue(value) else {
+        guard let value = reply.body.first, let data = client.dataFromValue(value) else {
             throw BluetoothError.invalidState("BlueZ ReadValue returned invalid data")
         }
 
@@ -211,9 +207,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         for characteristic: GATTCharacteristic,
         type: GATTWriteType
     ) async throws {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let path = try await resolveCharacteristicPath(characteristic, connection: connection)
         let bytes = value.map { DBusValue.byte($0) }
@@ -222,7 +216,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         options[.string("type")] = .variant(DBusVariant(.string(writeType)))
 
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: path,
             interface: "org.bluez.GattCharacteristic1",
             method: "WriteValue",
@@ -235,7 +229,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("BlueZ WriteValue failed: \(name)")
         }
     }
@@ -243,9 +237,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     func notifications(
         for characteristic: GATTCharacteristic
     ) async throws -> AsyncThrowingStream<GATTNotification, Error> {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let path = try await resolveCharacteristicPath(characteristic, connection: connection)
         let initialType: GATTClientSubscriptionType = characteristic.properties.contains(.indicate) ? .indication : .notification
@@ -267,35 +259,33 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         for characteristic: GATTCharacteristic,
         type: GATTClientSubscriptionType
     ) async throws {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let path = try await resolveCharacteristicPath(characteristic, connection: connection)
         if enabled {
             let request = DBusRequest.createMethodCall(
-                destination: bluezBusName,
+                destination: client.busName,
                 path: path,
                 interface: "org.bluez.GattCharacteristic1",
                 method: "StartNotify"
             )
             guard let reply = try await connection.send(request) else { return }
             if reply.messageType == .error {
-                let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+                let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
                 if name != "org.bluez.Error.InProgress" {
                     throw BluetoothError.invalidState("BlueZ StartNotify failed: \(name)")
                 }
             }
         } else {
             let request = DBusRequest.createMethodCall(
-                destination: bluezBusName,
+                destination: client.busName,
                 path: path,
                 interface: "org.bluez.GattCharacteristic1",
                 method: "StopNotify"
             )
             guard let reply = try await connection.send(request) else { return }
             if reply.messageType == .error {
-                let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+                let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
                 if name != "org.bluez.Error.NotPermitted" {
                     throw BluetoothError.invalidState("BlueZ StopNotify failed: \(name)")
                 }
@@ -308,9 +298,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     func discoverDescriptors(for characteristic: GATTCharacteristic) async throws -> [GATTDescriptor] {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         await waitForServicesResolved()
         let cache = try await loadGattObjects(connection)
@@ -326,13 +314,11 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     func readValue(for descriptor: GATTDescriptor) async throws -> Data {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let path = try await resolveDescriptorPath(descriptor, connection: connection)
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: path,
             interface: "org.bluez.GattDescriptor1",
             method: "ReadValue",
@@ -346,7 +332,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             throw BluetoothError.invalidState("BlueZ ReadDescriptor failed")
         }
 
-        guard let value = reply.body.first, let data = dataFromValue(value) else {
+        guard let value = reply.body.first, let data = client.dataFromValue(value) else {
             throw BluetoothError.invalidState("BlueZ ReadDescriptor returned invalid data")
         }
 
@@ -354,14 +340,12 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     }
 
     func writeValue(_ value: Data, for descriptor: GATTDescriptor) async throws {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let path = try await resolveDescriptorPath(descriptor, connection: connection)
         let bytes = value.map { DBusValue.byte($0) }
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: path,
             interface: "org.bluez.GattDescriptor1",
             method: "WriteValue",
@@ -374,18 +358,16 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("BlueZ WriteDescriptor failed: \(name)")
         }
     }
 
     func readRSSI() async throws -> Int {
-        guard let connection else {
-            throw BluetoothError.invalidState("BlueZ connection not ready")
-        }
+        let connection = try await client.getConnection()
 
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: devicePath,
             interface: "org.freedesktop.DBus.Properties",
             method: "Get",
@@ -403,8 +385,8 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             throw BluetoothError.invalidState("BlueZ RSSI read returned no data")
         }
 
-        let value = unwrapVariant(body)
-        guard let rssi = parseInt(value) else {
+        let value = client.unwrapVariant(body)
+        guard let rssi = client.parseInt(value) else {
             throw BluetoothError.invalidState("BlueZ RSSI read returned unsupported type")
         }
 
@@ -419,7 +401,8 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         guard case .connected = stateValue else {
             throw BluetoothError.invalidState("BlueZ L2CAP requires an active connection")
         }
-        if parameters.requiresEncryption, let connection {
+        if parameters.requiresEncryption {
+            let connection = try await client.getConnection()
             if let agentController {
                 await agentController.registerPeripheralDevice(path: devicePath)
             }
@@ -447,60 +430,49 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
     private func runConnection() async {
         do {
-            let address = try SocketAddress(unixDomainSocketPath: "/var/run/dbus/system_bus_socket")
-            let auth = AuthType.external(userID: String(getuid()))
+            let connection = try await client.getConnection()
 
-            try await DBusClient.withConnection(to: address, auth: auth) { connection in
-                do {
-                    await self.setConnection(connection)
-                    await connection.setMessageHandler { [weak self] message in
-                        await self?.handleMessage(message, connection: connection)
-                    }
-
-                    try await self.addMatchRules(connection)
-                    try await self.loadDeviceProperties(connection)
-
-                    if let agentController = self.agentController {
-                        await agentController.registerPeripheralDevice(path: self.devicePath)
-                    }
-
-                    if self.requiresBonding {
-                        try await self.ensureAgentAvailable(connection)
-                        try await self.pairIfNeeded(connection)
-                    }
-
-                    if !(await self.isConnected()) {
-                        if self.verbose {
-                            print("[bluez] Connecting to \(self.devicePath)")
-                        }
-                        try await self.connectDevice(connection)
-                        await self.updateState(.connected)
-                        try await self.loadDeviceProperties(connection)
-                    }
-
-                    await self.resumeConnectIfNeeded()
-                    await self.waitForStop()
-
-                    if await self.isConnected() {
-                        if self.verbose {
-                            print("[bluez] Disconnecting from \(self.devicePath)")
-                        }
-                        try await self.disconnectDevice(connection)
-                        await self.updateState(.disconnected(reason: nil))
-                    }
-
-                    await self.unregisterAgentIfNeeded(connection)
-                    await self.setConnection(nil)
-                } catch {
-                    await self.unregisterAgentIfNeeded(connection)
-                    await self.setConnection(nil)
-                    throw error
-                }
+            let handlerID = client.addMessageHandler { [weak self] message in
+                await self?.handleMessage(message, connection: connection)
             }
+            messageHandlerID = handlerID
+
+            try await addMatchRules(connection)
+            try await loadDeviceProperties(connection)
+
+            if let agentController {
+                await agentController.registerPeripheralDevice(path: devicePath)
+            }
+
+            if requiresBonding {
+                try await ensureAgentAvailable(connection)
+                try await pairIfNeeded(connection)
+            }
+
+            if !isConnected() {
+                if verbose {
+                    print("[bluez] Connecting to \(devicePath)")
+                }
+                try await connectDevice(connection)
+                updateState(.connected)
+                try await loadDeviceProperties(connection)
+            }
+
+            resumeConnectIfNeeded()
+            await waitForStop()
+
+            if isConnected() {
+                if verbose {
+                    print("[bluez] Disconnecting from \(devicePath)")
+                }
+                try await disconnectDevice(connection)
+                updateState(.disconnected(reason: nil))
+            }
+
+            await unregisterAgentIfNeeded(connection)
         } catch {
             resumeConnectIfNeeded(error: error)
             updateState(.disconnected(reason: String(describing: error)))
-            setConnection(nil)
         }
 
         cleanup()
@@ -508,46 +480,39 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
     private func addMatchRules(_ connection: DBusClient.Connection) async throws {
         let rules = [
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='\(devicePath)'",
-            "type='signal',sender='\(bluezBusName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path_namespace='\(devicePath)',arg0='org.bluez.GattCharacteristic1'"
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='\(devicePath)'",
+            "type='signal',sender='\(client.busName)',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path_namespace='\(devicePath)',arg0='org.bluez.GattCharacteristic1'"
         ]
 
         for rule in rules {
-            let request = DBusRequest.createMethodCall(
-                destination: "org.freedesktop.DBus",
-                path: "/org/freedesktop/DBus",
-                interface: "org.freedesktop.DBus",
-                method: "AddMatch",
-                body: [.string(rule)]
-            )
-            _ = try await connection.send(request)
+            try await client.addMatchRule(rule)
         }
     }
 
     private func connectDevice(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: devicePath,
             interface: "org.bluez.Device1",
             method: "Connect"
         )
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("D-Bus Connect failed: \(name)")
         }
     }
 
     private func disconnectDevice(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: devicePath,
             interface: "org.bluez.Device1",
             method: "Disconnect"
         )
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name == "org.bluez.Error.NotConnected" {
                 return
             }
@@ -572,7 +537,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
 
         let registerRequest = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: "/org/bluez",
             interface: "org.bluez.AgentManager1",
             method: "RegisterAgent",
@@ -583,14 +548,14 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         )
 
         if let reply = try await connection.send(registerRequest), reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name != "org.bluez.Error.AlreadyExists" {
                 throw BluetoothError.invalidState("D-Bus RegisterAgent failed: \(name)")
             }
         }
 
         let defaultRequest = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: "/org/bluez",
             interface: "org.bluez.AgentManager1",
             method: "RequestDefaultAgent",
@@ -598,7 +563,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         )
 
         if let reply = try await connection.send(defaultRequest), reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name != "org.bluez.Error.AlreadyExists" {
                 throw BluetoothError.invalidState("D-Bus RequestDefaultAgent failed: \(name)")
             }
@@ -612,7 +577,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         guard agentRegistered else { return }
 
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: "/org/bluez",
             interface: "org.bluez.AgentManager1",
             method: "UnregisterAgent",
@@ -621,7 +586,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         do {
             if let reply = try await connection.send(request), reply.messageType == .error {
-                let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+                let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
                 if verbose {
                     print("[bluez] UnregisterAgent failed: \(name)")
                 }
@@ -648,14 +613,14 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
 
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: devicePath,
             interface: "org.bluez.Device1",
             method: "Pair"
         )
 
         if let reply = try await connection.send(request), reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             if name != "org.bluez.Error.AlreadyExists" {
                 throw BluetoothError.invalidState("D-Bus Pair failed: \(name)")
             }
@@ -670,7 +635,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
     private func setTrusted(_ connection: DBusClient.Connection, value: Bool) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: devicePath,
             interface: "org.freedesktop.DBus.Properties",
             method: "Set",
@@ -683,14 +648,14 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         guard let reply = try await connection.send(request) else { return }
         if reply.messageType == .error {
-            let name = dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
             throw BluetoothError.invalidState("D-Bus Set Trusted failed: \(name)")
         }
     }
 
     private func loadDeviceProperties(_ connection: DBusClient.Connection) async throws {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: devicePath,
             interface: "org.freedesktop.DBus.Properties",
             method: "GetAll",
@@ -882,7 +847,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     private func handleProperties(_ props: [DBusValue: DBusValue]) {
         for (keyValue, rawValue) in props {
             guard case .string(let key) = keyValue else { continue }
-            let value = unwrapVariant(rawValue)
+            let value = client.unwrapVariant(rawValue)
 
             switch key {
             case "Connected":
@@ -893,11 +858,11 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
                     }
                 }
             case "MTU":
-                if let mtu = parseInt(value) {
+                if let mtu = client.parseInt(value) {
                     updateMtu(mtu)
                 }
             case "RSSI":
-                if let rssi = parseInt(value) {
+                if let rssi = client.parseInt(value) {
                     rssiValue = rssi
                 }
             case "Paired":
@@ -925,8 +890,8 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         for (keyValue, rawValue) in properties {
             guard case .string(let key) = keyValue else { continue }
             guard key == "Value" else { continue }
-            let value = unwrapVariant(rawValue)
-            guard let data = dataFromValue(value) else { continue }
+            let value = client.unwrapVariant(rawValue)
+            guard let data = client.dataFromValue(value) else { continue }
             let notification: GATTNotification = (state.type == .indication)
                 ? .indication(data)
                 : .notification(data)
@@ -1006,7 +971,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
     private func loadGattObjects(_ connection: DBusClient.Connection) async throws -> GattObjectCache {
         let request = DBusRequest.createMethodCall(
-            destination: bluezBusName,
+            destination: client.busName,
             path: "/",
             interface: "org.freedesktop.DBus.ObjectManager",
             method: "GetManagedObjects"
@@ -1185,10 +1150,6 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
     }
 
-    private func setConnection(_ connection: DBusClient.Connection?) {
-        self.connection = connection
-    }
-
     private func removeStateContinuation(_ id: UUID) {
         stateContinuations[id] = nil
     }
@@ -1207,13 +1168,16 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         connectContinuation = nil
         task?.cancel()
         task = nil
-        connection = nil
         servicesResolved = false
         resumeServicesResolvedWaiters()
         finishNotificationStreams()
         servicePathByService.removeAll()
         characteristicPathByCharacteristic.removeAll()
         descriptorPathByDescriptor.removeAll()
+        if let handlerID = messageHandlerID {
+            client.removeMessageHandler(handlerID)
+            messageHandlerID = nil
+        }
         if let agentController {
             Task { await agentController.unregisterDevice(path: devicePath) }
         }
@@ -1260,7 +1224,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     ) -> DBusValue? {
         for (keyValue, rawValue) in props {
             guard case .string(let name) = keyValue, name == key else { continue }
-            return unwrapVariant(rawValue)
+            return client.unwrapVariant(rawValue)
         }
         return nil
     }
@@ -1286,13 +1250,13 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
     private func parseService(_ props: [DBusValue: DBusValue]) -> GATTService? {
         guard let uuidString = propertyString(props, key: "UUID"),
-              let uuid = parseBluetoothUUID(uuidString)
+              let uuid = client.parseBluetoothUUID(uuidString)
         else {
             return nil
         }
 
         let isPrimary = propertyValue(props, key: "Primary")?.boolean ?? true
-        let handle = propertyValue(props, key: "Handle").flatMap(parseInt)
+        let handle = propertyValue(props, key: "Handle").flatMap(client.parseInt)
         let instanceID = handle.map { UInt32($0) }
         return GATTService(uuid: uuid, isPrimary: isPrimary, instanceID: instanceID)
     }
@@ -1302,7 +1266,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         servicesByPath: [String: GATTService]
     ) -> (servicePath: String, characteristic: GATTCharacteristic)? {
         guard let uuidString = propertyString(props, key: "UUID"),
-              let uuid = parseBluetoothUUID(uuidString)
+              let uuid = client.parseBluetoothUUID(uuidString)
         else {
             return nil
         }
@@ -1315,7 +1279,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         let flags = propertyStringArray(props, key: "Flags") ?? []
         let properties = parseCharacteristicProperties(flags)
-        let handle = propertyValue(props, key: "Handle").flatMap(parseInt)
+        let handle = propertyValue(props, key: "Handle").flatMap(client.parseInt)
         let instanceID = handle.map { UInt32($0) }
 
         let characteristic = GATTCharacteristic(
@@ -1333,7 +1297,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         characteristicsByPath: [String: GATTCharacteristic]
     ) -> (characteristicPath: String, descriptor: GATTDescriptor)? {
         guard let uuidString = propertyString(props, key: "UUID"),
-              let uuid = parseBluetoothUUID(uuidString)
+              let uuid = client.parseBluetoothUUID(uuidString)
         else {
             return nil
         }
@@ -1373,35 +1337,6 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             }
         }
         return properties
-    }
-
-    private func parseBluetoothUUID(_ value: String) -> BluetoothUUID? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        let noPrefix = trimmed.hasPrefix("0x") ? String(trimmed.dropFirst(2)) : trimmed
-        if noPrefix.contains("-"), let uuid = UUID(uuidString: noPrefix) {
-            return .bit128(uuid)
-        }
-        if noPrefix.count <= 4, let short = UInt16(noPrefix, radix: 16) {
-            return .bit16(short)
-        }
-        if noPrefix.count <= 8, let mid = UInt32(noPrefix, radix: 16) {
-            return .bit32(mid)
-        }
-        return nil
-    }
-
-    private func dataFromValue(_ value: DBusValue) -> Data? {
-        let unwrapped = unwrapVariant(value)
-        guard case .array(let values) = unwrapped else { return nil }
-        var bytes: [UInt8] = []
-        for entry in values {
-            if case .byte(let byte) = entry {
-                bytes.append(byte)
-            } else {
-                return nil
-            }
-        }
-        return Data(bytes)
     }
 
     private struct AgentConfig: Sendable {
@@ -1527,36 +1462,6 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
                 descriptorsByCharacteristicPath: [:]
             )
         }
-    }
-
-    private func dbusErrorName(_ message: DBusMessage) -> String? {
-        guard
-            let field = message.headerFields.first(where: { $0.code == .errorName }),
-            case .string(let name) = field.variant.value
-        else {
-            return nil
-        }
-        return name
-    }
-
-    private func parseInt(_ value: DBusValue) -> Int? {
-        switch value {
-        case .int16(let v): return Int(v)
-        case .int32(let v): return Int(v)
-        case .int64(let v): return Int(v)
-        case .uint16(let v): return Int(v)
-        case .uint32(let v): return Int(v)
-        case .uint64(let v): return Int(v)
-        default:
-            return nil
-        }
-    }
-
-    private func unwrapVariant(_ value: DBusValue) -> DBusValue {
-        if case .variant(let variant) = value {
-            return variant.value
-        }
-        return value
     }
 
     private static func extractAddress(from peripheral: Peripheral) -> String? {

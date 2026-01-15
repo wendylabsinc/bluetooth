@@ -111,54 +111,49 @@ extension GATTAttributePermissions {
 }
 
 // MARK: - Sendable Wrappers for CoreBluetooth Types
+// These wrappers are necessary because CoreBluetooth types are not Sendable.
+// With @preconcurrency import, we can wrap them in Sendable structs.
+// Safety: CoreBluetooth objects are thread-safe when accessed from their designated queue (.main)
 
-/// Wrapper to make CBPeripheral sendable across actor boundaries
-/// Safety: CoreBluetooth objects are thread-safe when accessed from their designated queue
 @usableFromInline
-struct SendablePeripheral: @unchecked Sendable {
-    let peripheral: CBPeripheral
+struct SendablePeripheral: Sendable {
+    @preconcurrency let peripheral: CBPeripheral
     init(_ peripheral: CBPeripheral) { self.peripheral = peripheral }
 }
 
-/// Wrapper to make CBService sendable across actor boundaries
 @usableFromInline
-struct SendableService: @unchecked Sendable {
-    let service: CBService
+struct SendableService: Sendable {
+    @preconcurrency let service: CBService
     init(_ service: CBService) { self.service = service }
 }
 
-/// Wrapper to make CBCharacteristic sendable across actor boundaries
 @usableFromInline
-struct SendableCharacteristic: @unchecked Sendable {
-    let characteristic: CBCharacteristic
+struct SendableCharacteristic: Sendable {
+    @preconcurrency let characteristic: CBCharacteristic
     init(_ characteristic: CBCharacteristic) { self.characteristic = characteristic }
 }
 
-/// Wrapper to make CBDescriptor sendable across actor boundaries
 @usableFromInline
-struct SendableDescriptor: @unchecked Sendable {
-    let descriptor: CBDescriptor
+struct SendableDescriptor: Sendable {
+    @preconcurrency let descriptor: CBDescriptor
     init(_ descriptor: CBDescriptor) { self.descriptor = descriptor }
 }
 
-/// Wrapper to make CBL2CAPChannel sendable across actor boundaries
 @usableFromInline
-struct SendableL2CAPChannel: @unchecked Sendable {
-    let channel: CBL2CAPChannel
+struct SendableL2CAPChannel: Sendable {
+    @preconcurrency let channel: CBL2CAPChannel
     init(_ channel: CBL2CAPChannel) { self.channel = channel }
 }
 
-/// Wrapper to make CBATTRequest sendable across actor boundaries
 @usableFromInline
-struct SendableATTRequest: @unchecked Sendable {
-    let request: CBATTRequest
+struct SendableATTRequest: Sendable {
+    @preconcurrency let request: CBATTRequest
     init(_ request: CBATTRequest) { self.request = request }
 }
 
-/// Wrapper to make CBCentral sendable across actor boundaries
 @usableFromInline
-struct SendableCentral: @unchecked Sendable {
-    let central: CBCentral
+struct SendableCentral: Sendable {
+    @preconcurrency let central: CBCentral
     init(_ central: CBCentral) { self.central = central }
 }
 
@@ -187,9 +182,63 @@ struct SendableAdvertisementData: Sendable {
 
 // MARK: - Central Manager Backend
 
-actor _CoreBluetoothCentralBackend: _CentralBackend {
+struct _CoreBluetoothCentralBackend: _CentralBackend {
+    private let controller: _CoreBluetoothCentralController
+
+    var state: BluetoothState {
+        controller.state
+    }
+
+    init() {
+        self.controller = _CoreBluetoothCentralController()
+    }
+
+    func stateUpdates() -> AsyncStream<BluetoothState> {
+        let currentState = state
+        return AsyncStream { continuation in
+            continuation.yield(currentState)
+            Task {
+                await controller.setStateUpdatesContinuation(continuation)
+            }
+            continuation.onTermination = { _ in
+                Task { await controller.clearStateUpdatesContinuation() }
+            }
+        }
+    }
+
+    func stopScan() async throws {
+        await controller.stopScan()
+    }
+
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func removeBond(for peripheral: Peripheral) async throws {
+        throw BluetoothError.unimplemented("Bond removal not available in CoreBluetooth - use system Settings")
+    }
+
+    func scan(
+        filter: ScanFilter?,
+        parameters: ScanParameters
+    ) async throws -> AsyncThrowingStream<ScanResult, Error> {
+        try await controller.scan(filter: filter, parameters: parameters)
+    }
+
+    func connect(
+        to peripheral: Peripheral,
+        options: ConnectionOptions
+    ) async throws -> any _PeripheralConnectionBackend {
+        try await controller.connect(to: peripheral, options: options)
+    }
+}
+
+private actor _CoreBluetoothCentralController {
     private let delegate: CentralManagerDelegate
-    private nonisolated(unsafe) let centralManager: CBCentralManager
+    private let centralManager: CBCentralManager
+    private let cachedState: Mutex<BluetoothState>
     private var stateUpdatesContinuation: AsyncStream<BluetoothState>.Continuation?
     private var scanContinuation: AsyncThrowingStream<ScanResult, Error>.Continuation?
     private var currentFilter: ScanFilter?
@@ -198,13 +247,15 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
     private var activeConnections: [UUID: _CoreBluetoothPeripheralConnectionBackend] = [:]
 
     nonisolated var state: BluetoothState {
-        BluetoothState(centralManager.state)
+        cachedState.withLock { $0 }
     }
 
     init() {
         let delegate = CentralManagerDelegate()
         self.delegate = delegate
-        self.centralManager = CBCentralManager(delegate: delegate, queue: .main)
+        let centralManager = CBCentralManager(delegate: delegate, queue: .main)
+        self.centralManager = centralManager
+        self.cachedState = Mutex(BluetoothState(centralManager.state))
         Task { await setupDelegateCallbacks() }
     }
 
@@ -216,16 +267,14 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
 
         delegate.onDiscover = { [weak self] peripheral, advertisementData, rssi in
             guard let self else { return }
-            let wrapped = SendablePeripheral(peripheral)
             let advData = SendableAdvertisementData(peripheral: peripheral, advertisementData: advertisementData)
             let rssiValue = rssi.intValue
-            Task { await self.handleDiscovery(wrapped, advData, rssiValue) }
+            Task { await self.handleDiscovery(peripheral, advData, rssiValue) }
         }
 
         delegate.onConnect = { [weak self] peripheral in
             guard let self else { return }
-            let wrapped = SendablePeripheral(peripheral)
-            Task { await self.handleConnect(wrapped) }
+            Task { await self.handleConnect(peripheral) }
         }
 
         delegate.onFailToConnect = { [weak self] peripheral, error in
@@ -243,11 +292,12 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
     }
 
     private func handleStateUpdate(_ cbState: CBManagerState) {
-        stateUpdatesContinuation?.yield(BluetoothState(cbState))
+        let newState = BluetoothState(cbState)
+        cachedState.withLock { $0 = newState }
+        stateUpdatesContinuation?.yield(newState)
     }
 
-    private func handleDiscovery(_ wrapped: SendablePeripheral, _ sendableAdvData: SendableAdvertisementData, _ rssi: Int) {
-        let peripheral = wrapped.peripheral
+    private func handleDiscovery(_ peripheral: CBPeripheral, _ sendableAdvData: SendableAdvertisementData, _ rssi: Int) {
         discoveredPeripherals[sendableAdvData.peripheralId] = peripheral
 
         let serviceUUIDs = sendableAdvData.serviceUUIDs.compactMap { uuidString -> BluetoothUUID? in
@@ -310,11 +360,9 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
         scanContinuation?.yield(result)
     }
 
-    private func handleConnect(_ wrapped: SendablePeripheral) {
-        let peripheral = wrapped.peripheral
+    private func handleConnect(_ peripheral: CBPeripheral) {
         if let continuation = pendingConnections.removeValue(forKey: peripheral.identifier) {
             let connectionBackend = _CoreBluetoothPeripheralConnectionBackend(peripheral: peripheral, centralManager: centralManager)
-            // Track active connection so we can notify on disconnect
             activeConnections[peripheral.identifier] = connectionBackend
             continuation.resume(returning: connectionBackend)
         }
@@ -327,12 +375,10 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
     }
 
     private func handleDisconnect(_ peripheralId: UUID) {
-        // Check if there's a pending connection that needs to be failed
         if let continuation = pendingConnections.removeValue(forKey: peripheralId) {
             continuation.resume(throwing: BluetoothError.connectionFailed("Peripheral disconnected during connection"))
         }
 
-        // Notify active connection backend about disconnect
         if let connectionBackend = activeConnections.removeValue(forKey: peripheralId) {
             Task {
                 await connectionBackend.handleRemoteDisconnect(reason: "Peripheral disconnected")
@@ -340,42 +386,24 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
         }
     }
 
-    func stateUpdates() -> AsyncStream<BluetoothState> {
-        AsyncStream { continuation in
-            self.stateUpdatesContinuation = continuation
-            continuation.yield(BluetoothState(centralManager.state))
-
-            continuation.onTermination = { [weak self] _ in
-                guard let self else { return }
-                Task { await self.clearStateUpdatesContinuation() }
-            }
-        }
+    func setStateUpdatesContinuation(_ continuation: AsyncStream<BluetoothState>.Continuation) {
+        stateUpdatesContinuation = continuation
     }
 
-    private func clearStateUpdatesContinuation() {
+    func clearStateUpdatesContinuation() {
         stateUpdatesContinuation = nil
     }
 
-    func stopScan() async throws {
+    func stopScan() {
         centralManager.stopScan()
         scanContinuation?.finish()
         scanContinuation = nil
     }
 
-    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
-        AsyncThrowingStream { continuation in
-            continuation.finish()
-        }
-    }
-
-    func removeBond(for peripheral: Peripheral) async throws {
-        throw BluetoothError.unimplemented("Bond removal not available in CoreBluetooth - use system Settings")
-    }
-
     func scan(
         filter: ScanFilter?,
         parameters: ScanParameters
-    ) async throws -> AsyncThrowingStream<ScanResult, Error> {
+    ) throws -> AsyncThrowingStream<ScanResult, Error> {
         guard centralManager.state == .poweredOn else {
             throw BluetoothError.notReady("Bluetooth is not powered on")
         }
@@ -422,16 +450,12 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
             throw BluetoothError.invalidPeripheral("Peripheral not found")
         }
 
-        // Store the peripheral to prevent deallocation during connection
         discoveredPeripherals[uuid] = cbPeripheral
 
-        // Default connection timeout of 30 seconds
         let timeoutSeconds: Double = 30.0
 
-        // Start timeout task
         let timeoutTask = Task {
             try await Task.sleep(for: .seconds(timeoutSeconds))
-            // If we get here, timeout occurred - cancel the connection
             self.handleConnectionTimeout(uuid: uuid, peripheral: cbPeripheral)
         }
 
@@ -440,18 +464,15 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
                 self.pendingConnections[uuid] = continuation
                 self.centralManager.connect(cbPeripheral, options: nil)
             }
-            // Connection succeeded, cancel timeout
             timeoutTask.cancel()
             return result
         } catch {
-            // Connection failed, cancel timeout
             timeoutTask.cancel()
             throw error
         }
     }
 
     private func handleConnectionTimeout(uuid: UUID, peripheral: CBPeripheral) {
-        // If there's still a pending connection, it timed out
         if let continuation = pendingConnections.removeValue(forKey: uuid) {
             centralManager.cancelPeripheralConnection(peripheral)
             continuation.resume(throwing: BluetoothError.connectionFailed("Connection timed out after 30 seconds"))
@@ -470,36 +491,60 @@ actor _CoreBluetoothCentralBackend: _CentralBackend {
 
 // MARK: - Central Manager Delegate
 
-/// Thread-safety note: This delegate is @unchecked Sendable because:
-/// 1. CoreBluetooth always calls delegate methods on the queue specified during CBCentralManager init (.main)
-/// 2. The closure properties are set once during setupDelegateCallbacks() before any BLE operations begin
-/// 3. After initial setup, closures are only read (not written) from delegate callbacks
-/// 4. The closures themselves are @Sendable and dispatch work to the actor via Task
-private final class CentralManagerDelegate: NSObject, CBCentralManagerDelegate, @unchecked Sendable {
-    var onStateUpdate: (@Sendable (CBManagerState) -> Void)?
-    var onDiscover: (@Sendable (CBPeripheral, [String: Any], NSNumber) -> Void)?
-    var onConnect: (@Sendable (CBPeripheral) -> Void)?
-    var onFailToConnect: (@Sendable (CBPeripheral, Error?) -> Void)?
-    var onDisconnect: (@Sendable (CBPeripheral, Error?) -> Void)?
+private final class CentralManagerDelegate: NSObject, CBCentralManagerDelegate, Sendable {
+    private struct Callbacks: Sendable {
+        var onStateUpdate: (@Sendable (CBManagerState) -> Void)?
+        var onDiscover: (@Sendable (CBPeripheral, [String: Any], NSNumber) -> Void)?
+        var onConnect: (@Sendable (CBPeripheral) -> Void)?
+        var onFailToConnect: (@Sendable (CBPeripheral, Error?) -> Void)?
+        var onDisconnect: (@Sendable (CBPeripheral, Error?) -> Void)?
+    }
+
+    private let callbacks = Mutex(Callbacks())
+
+    var onStateUpdate: (@Sendable (CBManagerState) -> Void)? {
+        get { callbacks.withLock { $0.onStateUpdate } }
+        set { callbacks.withLock { $0.onStateUpdate = newValue } }
+    }
+
+    var onDiscover: (@Sendable (CBPeripheral, [String: Any], NSNumber) -> Void)? {
+        get { callbacks.withLock { $0.onDiscover } }
+        set { callbacks.withLock { $0.onDiscover = newValue } }
+    }
+
+    var onConnect: (@Sendable (CBPeripheral) -> Void)? {
+        get { callbacks.withLock { $0.onConnect } }
+        set { callbacks.withLock { $0.onConnect = newValue } }
+    }
+
+    var onFailToConnect: (@Sendable (CBPeripheral, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onFailToConnect } }
+        set { callbacks.withLock { $0.onFailToConnect = newValue } }
+    }
+
+    var onDisconnect: (@Sendable (CBPeripheral, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onDisconnect } }
+        set { callbacks.withLock { $0.onDisconnect = newValue } }
+    }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        onStateUpdate?(central.state)
+        callbacks.withLock { $0.onStateUpdate }?(central.state)
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        onDiscover?(peripheral, advertisementData, RSSI)
+        callbacks.withLock { $0.onDiscover }?(peripheral, advertisementData, RSSI)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        onConnect?(peripheral)
+        callbacks.withLock { $0.onConnect }?(peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        onFailToConnect?(peripheral, error)
+        callbacks.withLock { $0.onFailToConnect }?(peripheral, error)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        onDisconnect?(peripheral, error)
+        callbacks.withLock { $0.onDisconnect }?(peripheral, error)
     }
 }
 
@@ -678,20 +723,18 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
     private func setupDelegateCallbacks() {
         delegate.onServicesDiscovered = { [weak self] services, error in
             guard let self else { return }
-            let wrapped = services?.map { SendableService($0) }
-            Task { await self.handleServicesDiscovered(wrapped, error) }
+            let wrappedServices = services?.map { SendableService($0) }
+            Task { await self.handleServicesDiscovered(wrappedServices, error) }
         }
 
         delegate.onCharacteristicsDiscovered = { [weak self] service, error in
             guard let self else { return }
-            let wrapped = SendableService(service)
-            Task { await self.handleCharacteristicsDiscovered(wrapped, error) }
+            Task { await self.handleCharacteristicsDiscovered(service, error) }
         }
 
         delegate.onDescriptorsDiscovered = { [weak self] characteristic, error in
             guard let self else { return }
-            let wrapped = SendableCharacteristic(characteristic)
-            Task { await self.handleDescriptorsDiscovered(wrapped, error) }
+            Task { await self.handleDescriptorsDiscovered(characteristic, error) }
         }
 
         delegate.onCharacteristicValueUpdated = { [weak self] characteristic, error in
@@ -710,14 +753,12 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         delegate.onDescriptorValueUpdated = { [weak self] descriptor, error in
             guard let self else { return }
-            let wrapped = SendableDescriptor(descriptor)
-            Task { await self.handleDescriptorValueUpdated(wrapped, error) }
+            Task { await self.handleDescriptorValueUpdated(descriptor, error) }
         }
 
         delegate.onDescriptorWritten = { [weak self] descriptor, error in
             guard let self else { return }
-            let wrapped = SendableDescriptor(descriptor)
-            Task { await self.handleDescriptorWritten(wrapped, error) }
+            Task { await self.handleDescriptorWritten(descriptor, error) }
         }
 
         delegate.onNotificationStateChanged = { [weak self] characteristic, error in
@@ -734,8 +775,8 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
         delegate.onL2CAPChannelOpened = { [weak self] channel, error in
             guard let self else { return }
-            let wrapped = channel.map { SendableL2CAPChannel($0) }
-            Task { await self.handleL2CAPChannelOpened(wrapped, error) }
+            let wrappedChannel = channel.map { SendableL2CAPChannel($0) }
+            Task { await self.handleL2CAPChannelOpened(wrappedChannel, error) }
         }
     }
 
@@ -753,8 +794,7 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         serviceDiscoveryContinuation = nil
     }
 
-    private func handleCharacteristicsDiscovered(_ wrapped: SendableService, _ error: Error?) {
-        let service = wrapped.service
+    private func handleCharacteristicsDiscovered(_ service: CBService, _ error: Error?) {
         if let error {
             characteristicDiscoveryContinuations[service.uuid]?.resume(throwing: error)
         } else {
@@ -768,8 +808,7 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         characteristicDiscoveryContinuations[service.uuid] = nil
     }
 
-    private func handleDescriptorsDiscovered(_ wrapped: SendableCharacteristic, _ error: Error?) {
-        let characteristic = wrapped.characteristic
+    private func handleDescriptorsDiscovered(_ characteristic: CBCharacteristic, _ error: Error?) {
         if let error {
             descriptorDiscoveryContinuations[characteristic.uuid]?.resume(throwing: error)
         } else {
@@ -828,8 +867,7 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
     }
 
-    private func handleDescriptorValueUpdated(_ wrapped: SendableDescriptor, _ error: Error?) {
-        let descriptor = wrapped.descriptor
+    private func handleDescriptorValueUpdated(_ descriptor: CBDescriptor, _ error: Error?) {
         let key = descriptorKey(descriptor)
         guard var continuations = readDescriptorContinuations[key], !continuations.isEmpty else { return }
 
@@ -858,8 +896,7 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
     }
 
-    private func handleDescriptorWritten(_ wrapped: SendableDescriptor, _ error: Error?) {
-        let descriptor = wrapped.descriptor
+    private func handleDescriptorWritten(_ descriptor: CBDescriptor, _ error: Error?) {
         let key = descriptorKey(descriptor)
         guard var continuations = writeDescriptorContinuations[key], !continuations.isEmpty else { return }
 
@@ -899,11 +936,11 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
         }
     }
 
-    private func handleL2CAPChannelOpened(_ wrapped: SendableL2CAPChannel?, _ error: Error?) {
+    private func handleL2CAPChannelOpened(_ wrappedChannel: SendableL2CAPChannel?, _ error: Error?) {
         if let error {
             l2capChannelContinuation?.resume(throwing: error)
-        } else if let wrapped {
-            let l2capChannel = _CoreBluetoothL2CAPChannel(channel: wrapped.channel)
+        } else if let wrappedChannel {
+            let l2capChannel = _CoreBluetoothL2CAPChannel(channel: wrappedChannel.channel)
             l2capChannelContinuation?.resume(returning: l2capChannel)
         } else {
             l2capChannelContinuation?.resume(throwing: BluetoothError.l2capChannelError("Failed to open L2CAP channel"))
@@ -1171,65 +1208,206 @@ actor _CoreBluetoothPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
 // MARK: - Peripheral Delegate
 
-/// Thread-safety note: Same pattern as CentralManagerDelegate - closures set once before operations begin
-private final class PeripheralDelegate: NSObject, CBPeripheralDelegate, @unchecked Sendable {
-    var onServicesDiscovered: (@Sendable ([CBService]?, Error?) -> Void)?
-    var onCharacteristicsDiscovered: (@Sendable (CBService, Error?) -> Void)?
-    var onDescriptorsDiscovered: (@Sendable (CBCharacteristic, Error?) -> Void)?
-    var onCharacteristicValueUpdated: (@Sendable (CBCharacteristic, Error?) -> Void)?
-    var onCharacteristicWritten: (@Sendable (CBCharacteristic, Error?) -> Void)?
-    var onDescriptorValueUpdated: (@Sendable (CBDescriptor, Error?) -> Void)?
-    var onDescriptorWritten: (@Sendable (CBDescriptor, Error?) -> Void)?
-    var onNotificationStateChanged: (@Sendable (CBCharacteristic, Error?) -> Void)?
-    var onRSSIRead: (@Sendable (NSNumber, Error?) -> Void)?
-    var onL2CAPChannelOpened: (@Sendable (CBL2CAPChannel?, Error?) -> Void)?
+private final class PeripheralDelegate: NSObject, CBPeripheralDelegate, Sendable {
+    private struct Callbacks: Sendable {
+        var onServicesDiscovered: (@Sendable ([CBService]?, Error?) -> Void)?
+        var onCharacteristicsDiscovered: (@Sendable (CBService, Error?) -> Void)?
+        var onDescriptorsDiscovered: (@Sendable (CBCharacteristic, Error?) -> Void)?
+        var onCharacteristicValueUpdated: (@Sendable (CBCharacteristic, Error?) -> Void)?
+        var onCharacteristicWritten: (@Sendable (CBCharacteristic, Error?) -> Void)?
+        var onDescriptorValueUpdated: (@Sendable (CBDescriptor, Error?) -> Void)?
+        var onDescriptorWritten: (@Sendable (CBDescriptor, Error?) -> Void)?
+        var onNotificationStateChanged: (@Sendable (CBCharacteristic, Error?) -> Void)?
+        var onRSSIRead: (@Sendable (NSNumber, Error?) -> Void)?
+        var onL2CAPChannelOpened: (@Sendable (CBL2CAPChannel?, Error?) -> Void)?
+    }
+
+    private let callbacks = Mutex(Callbacks())
+
+    var onServicesDiscovered: (@Sendable ([CBService]?, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onServicesDiscovered } }
+        set { callbacks.withLock { $0.onServicesDiscovered = newValue } }
+    }
+
+    var onCharacteristicsDiscovered: (@Sendable (CBService, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onCharacteristicsDiscovered } }
+        set { callbacks.withLock { $0.onCharacteristicsDiscovered = newValue } }
+    }
+
+    var onDescriptorsDiscovered: (@Sendable (CBCharacteristic, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onDescriptorsDiscovered } }
+        set { callbacks.withLock { $0.onDescriptorsDiscovered = newValue } }
+    }
+
+    var onCharacteristicValueUpdated: (@Sendable (CBCharacteristic, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onCharacteristicValueUpdated } }
+        set { callbacks.withLock { $0.onCharacteristicValueUpdated = newValue } }
+    }
+
+    var onCharacteristicWritten: (@Sendable (CBCharacteristic, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onCharacteristicWritten } }
+        set { callbacks.withLock { $0.onCharacteristicWritten = newValue } }
+    }
+
+    var onDescriptorValueUpdated: (@Sendable (CBDescriptor, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onDescriptorValueUpdated } }
+        set { callbacks.withLock { $0.onDescriptorValueUpdated = newValue } }
+    }
+
+    var onDescriptorWritten: (@Sendable (CBDescriptor, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onDescriptorWritten } }
+        set { callbacks.withLock { $0.onDescriptorWritten = newValue } }
+    }
+
+    var onNotificationStateChanged: (@Sendable (CBCharacteristic, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onNotificationStateChanged } }
+        set { callbacks.withLock { $0.onNotificationStateChanged = newValue } }
+    }
+
+    var onRSSIRead: (@Sendable (NSNumber, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onRSSIRead } }
+        set { callbacks.withLock { $0.onRSSIRead = newValue } }
+    }
+
+    var onL2CAPChannelOpened: (@Sendable (CBL2CAPChannel?, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onL2CAPChannelOpened } }
+        set { callbacks.withLock { $0.onL2CAPChannelOpened = newValue } }
+    }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        onServicesDiscovered?(peripheral.services, error)
+        callbacks.withLock { $0.onServicesDiscovered }?(peripheral.services, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        onCharacteristicsDiscovered?(service, error)
+        callbacks.withLock { $0.onCharacteristicsDiscovered }?(service, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverDescriptorsFor characteristic: CBCharacteristic, error: Error?) {
-        onDescriptorsDiscovered?(characteristic, error)
+        callbacks.withLock { $0.onDescriptorsDiscovered }?(characteristic, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        onCharacteristicValueUpdated?(characteristic, error)
+        callbacks.withLock { $0.onCharacteristicValueUpdated }?(characteristic, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        onCharacteristicWritten?(characteristic, error)
+        callbacks.withLock { $0.onCharacteristicWritten }?(characteristic, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor descriptor: CBDescriptor, error: Error?) {
-        onDescriptorValueUpdated?(descriptor, error)
+        callbacks.withLock { $0.onDescriptorValueUpdated }?(descriptor, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor descriptor: CBDescriptor, error: Error?) {
-        onDescriptorWritten?(descriptor, error)
+        callbacks.withLock { $0.onDescriptorWritten }?(descriptor, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        onNotificationStateChanged?(characteristic, error)
+        callbacks.withLock { $0.onNotificationStateChanged }?(characteristic, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
-        onRSSIRead?(RSSI, error)
+        callbacks.withLock { $0.onRSSIRead }?(RSSI, error)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didOpen channel: CBL2CAPChannel?, error: Error?) {
-        onL2CAPChannelOpened?(channel, error)
+        callbacks.withLock { $0.onL2CAPChannelOpened }?(channel, error)
     }
 }
 
 // MARK: - Peripheral Manager Backend
 
-actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
+struct _CoreBluetoothPeripheralBackend: _PeripheralBackend {
+    private let controller: _CoreBluetoothPeripheralController
+
+    var state: BluetoothState {
+        controller.state
+    }
+
+    init() {
+        self.controller = _CoreBluetoothPeripheralController()
+    }
+
+    func stateUpdates() -> AsyncStream<BluetoothState> {
+        let currentState = state
+        return AsyncStream { continuation in
+            continuation.yield(currentState)
+            Task {
+                await controller.setStateUpdatesContinuation(continuation)
+            }
+            continuation.onTermination = { _ in
+                Task { await controller.clearStateUpdatesContinuation() }
+            }
+        }
+    }
+
+    func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
+        await controller.connectionEvents()
+    }
+
+    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
+        try await controller.startAdvertising(advertisingData: advertisingData, scanResponseData: scanResponseData, parameters: parameters)
+    }
+
+    func startAdvertisingSet(_ configuration: AdvertisingSetConfiguration) async throws -> AdvertisingSetID {
+        throw BluetoothError.unimplemented("Extended advertising sets not available in CoreBluetooth")
+    }
+
+    func updateAdvertisingSet(_ id: AdvertisingSetID, configuration: AdvertisingSetConfiguration) async throws {
+        throw BluetoothError.unimplemented("Extended advertising sets not available in CoreBluetooth")
+    }
+
+    func stopAdvertising() async {
+        await controller.stopAdvertising()
+    }
+
+    func stopAdvertisingSet(_ id: AdvertisingSetID) async {
+        // No-op for CoreBluetooth
+    }
+
+    func disconnect(_ central: Central) async throws {
+        throw BluetoothError.unimplemented("Direct disconnect not available in CoreBluetooth peripheral role")
+    }
+
+    func removeBond(for central: Central) async throws {
+        throw BluetoothError.unimplemented("Bond removal not available in CoreBluetooth - use system Settings")
+    }
+
+    func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
+        try await controller.addService(service)
+    }
+
+    func removeService(_ registration: GATTServiceRegistration) async throws {
+        try await controller.removeService(registration)
+    }
+
+    func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {
+        await controller.gattRequests()
+    }
+
+    func updateValue(_ value: Data, for characteristic: GATTCharacteristic, type: GATTServerUpdateType) async throws {
+        try await controller.updateValue(value, for: characteristic, type: type)
+    }
+
+    func publishL2CAPChannel(parameters: L2CAPChannelParameters) async throws -> L2CAPPSM {
+        try await controller.publishL2CAPChannel(parameters: parameters)
+    }
+
+    func incomingL2CAPChannels(psm: L2CAPPSM) async throws -> AsyncThrowingStream<any L2CAPChannel, Error> {
+        await controller.incomingL2CAPChannels(psm: psm)
+    }
+}
+
+private actor _CoreBluetoothPeripheralController {
     private let delegate: PeripheralManagerDelegate
-    private nonisolated(unsafe) let peripheralManager: CBPeripheralManager
+    private let peripheralManager: CBPeripheralManager
+    private let cachedState: Mutex<BluetoothState>
     private var stateUpdatesContinuation: AsyncStream<BluetoothState>.Continuation?
     private var connectionEventsContinuation: AsyncThrowingStream<PeripheralConnectionEvent, Error>.Continuation?
     private var gattRequestsContinuation: AsyncThrowingStream<GATTServerRequest, Error>.Continuation?
@@ -1248,13 +1426,15 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
     private var publishedL2CAPChannels: [UInt16: AsyncThrowingStream<any L2CAPChannel, Error>.Continuation] = [:]
 
     nonisolated var state: BluetoothState {
-        BluetoothState(peripheralManager.state)
+        cachedState.withLock { $0 }
     }
 
     init() {
         let delegate = PeripheralManagerDelegate()
         self.delegate = delegate
-        self.peripheralManager = CBPeripheralManager(delegate: delegate, queue: .main)
+        let peripheralManager = CBPeripheralManager(delegate: delegate, queue: .main)
+        self.peripheralManager = peripheralManager
+        self.cachedState = Mutex(BluetoothState(peripheralManager.state))
         Task { await setupDelegateCallbacks() }
     }
 
@@ -1266,34 +1446,29 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
 
         delegate.onServiceAdded = { [weak self] service, error in
             guard let self else { return }
-            let wrapped = service.map { SendableService($0) }
-            Task { await self.handleServiceAdded(wrapped, error) }
+            let wrappedService = service.map { SendableService($0) }
+            Task { await self.handleServiceAdded(wrappedService, error) }
         }
 
         delegate.onCentralSubscribed = { [weak self] central, characteristic in
             guard let self else { return }
-            let wrappedCentral = SendableCentral(central)
-            let wrappedChar = SendableCharacteristic(characteristic)
-            Task { await self.handleCentralSubscribed(wrappedCentral, wrappedChar) }
+            Task { await self.handleCentralSubscribed(central, characteristic) }
         }
 
         delegate.onCentralUnsubscribed = { [weak self] central, characteristic in
             guard let self else { return }
-            let wrappedCentral = SendableCentral(central)
-            let wrappedChar = SendableCharacteristic(characteristic)
-            Task { await self.handleCentralUnsubscribed(wrappedCentral, wrappedChar) }
+            Task { await self.handleCentralUnsubscribed(central, characteristic) }
         }
 
         delegate.onReadRequest = { [weak self] request in
             guard let self else { return }
-            let wrapped = SendableATTRequest(request)
-            Task { await self.handleReadRequest(wrapped) }
+            Task { await self.handleReadRequest(request) }
         }
 
         delegate.onWriteRequests = { [weak self] requests in
             guard let self else { return }
-            let wrapped = requests.map { SendableATTRequest($0) }
-            Task { await self.handleWriteRequests(wrapped) }
+            let wrappedRequests = requests.map { SendableATTRequest($0) }
+            Task { await self.handleWriteRequests(wrappedRequests) }
         }
 
         delegate.onL2CAPChannelPublished = { [weak self] psm, error in
@@ -1303,22 +1478,24 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
 
         delegate.onL2CAPChannelOpened = { [weak self] channel, error in
             guard let self else { return }
-            let wrapped = channel.map { SendableL2CAPChannel($0) }
-            Task { await self.handleL2CAPChannelOpened(wrapped, error) }
+            let wrappedChannel = channel.map { SendableL2CAPChannel($0) }
+            Task { await self.handleL2CAPChannelOpened(wrappedChannel, error) }
         }
     }
 
     private func handleStateUpdate(_ cbState: CBManagerState) {
-        stateUpdatesContinuation?.yield(BluetoothState(cbState))
+        let newState = BluetoothState(cbState)
+        cachedState.withLock { $0 = newState }
+        stateUpdatesContinuation?.yield(newState)
     }
 
-    private func handleServiceAdded(_ wrapped: SendableService?, _ error: Error?) {
+    private func handleServiceAdded(_ wrappedService: SendableService?, _ error: Error?) {
         guard let continuation = addServiceContinuation else { return }
 
         if let error {
             continuation.resume(throwing: error)
-        } else if let wrapped, pendingServiceDefinition != nil {
-            let service = wrapped.service
+        } else if let wrappedService, pendingServiceDefinition != nil {
+            let service = wrappedService.service
             let gattService = GATTService(
                 uuid: BluetoothUUID(service.uuid),
                 isPrimary: service.isPrimary,
@@ -1336,9 +1513,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         pendingServiceDefinition = nil
     }
 
-    private func handleCentralSubscribed(_ wrappedCentral: SendableCentral, _ wrappedChar: SendableCharacteristic) {
-        let central = wrappedCentral.central
-        let characteristic = wrappedChar.characteristic
+    private func handleCentralSubscribed(_ central: CBCentral, _ characteristic: CBCharacteristic) {
         let centralDevice = Central(id: .uuid(central.identifier), name: nil)
 
         if let gattChar = findGATTCharacteristic(for: characteristic.uuid) {
@@ -1353,9 +1528,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         connectionEventsContinuation?.yield(.connected(centralDevice))
     }
 
-    private func handleCentralUnsubscribed(_ wrappedCentral: SendableCentral, _ wrappedChar: SendableCharacteristic) {
-        let central = wrappedCentral.central
-        let characteristic = wrappedChar.characteristic
+    private func handleCentralUnsubscribed(_ central: CBCentral, _ characteristic: CBCharacteristic) {
         let centralDevice = Central(id: .uuid(central.identifier), name: nil)
 
         if let gattChar = findGATTCharacteristic(for: characteristic.uuid) {
@@ -1368,8 +1541,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         }
     }
 
-    private func handleReadRequest(_ wrapped: SendableATTRequest) {
-        let request = wrapped.request
+    private func handleReadRequest(_ request: CBATTRequest) {
         guard let gattChar = findGATTCharacteristic(for: request.characteristic.uuid) else {
             peripheralManager.respond(to: request, withResult: .attributeNotFound)
             return
@@ -1405,8 +1577,8 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
     }
 
     private func handleWriteRequests(_ wrappedRequests: [SendableATTRequest]) {
-        for wrapped in wrappedRequests {
-            let request = wrapped.request
+        for wrappedRequest in wrappedRequests {
+            let request = wrappedRequest.request
             guard let gattChar = findGATTCharacteristic(for: request.characteristic.uuid) else {
                 peripheralManager.respond(to: request, withResult: .attributeNotFound)
                 continue
@@ -1462,8 +1634,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         l2capPSMContinuation = nil
     }
 
-    private func handleL2CAPChannelOpened(_ wrapped: SendableL2CAPChannel?, _ error: Error?) {
-        // Handle error case - propagate to all published channel continuations
+    private func handleL2CAPChannelOpened(_ wrappedChannel: SendableL2CAPChannel?, _ error: Error?) {
         if let error {
             for (_, continuation) in publishedL2CAPChannels {
                 continuation.finish(throwing: error)
@@ -1471,40 +1642,35 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
             return
         }
 
-        guard let wrapped else {
-            // No channel and no error - unexpected state, finish all streams with generic error
+        guard let wrappedChannel else {
             for (_, continuation) in publishedL2CAPChannels {
                 continuation.finish(throwing: BluetoothError.l2capChannelError("Failed to open L2CAP channel"))
             }
             return
         }
 
-        if let continuation = publishedL2CAPChannels[wrapped.channel.psm] {
-            let l2capChannel = _CoreBluetoothL2CAPChannel(channel: wrapped.channel)
+        let channel = wrappedChannel.channel
+        if let continuation = publishedL2CAPChannels[channel.psm] {
+            let l2capChannel = _CoreBluetoothL2CAPChannel(channel: channel)
             continuation.yield(l2capChannel)
         }
     }
 
-    func stateUpdates() -> AsyncStream<BluetoothState> {
-        AsyncStream { continuation in
-            self.stateUpdatesContinuation = continuation
-            continuation.yield(BluetoothState(peripheralManager.state))
-        }
+    func setStateUpdatesContinuation(_ continuation: AsyncStream<BluetoothState>.Continuation) {
+        stateUpdatesContinuation = continuation
     }
 
-    func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
+    func clearStateUpdatesContinuation() {
+        stateUpdatesContinuation = nil
+    }
+
+    func connectionEvents() -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
         AsyncThrowingStream { continuation in
             self.connectionEventsContinuation = continuation
         }
     }
 
-    func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
-        AsyncThrowingStream { continuation in
-            continuation.finish()
-        }
-    }
-
-    func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) async throws {
+    func startAdvertising(advertisingData: AdvertisementData, scanResponseData: AdvertisementData?, parameters: AdvertisingParameters) throws {
         guard peripheralManager.state == .poweredOn else {
             throw BluetoothError.notReady("Bluetooth is not powered on")
         }
@@ -1522,28 +1688,8 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         peripheralManager.startAdvertising(advData)
     }
 
-    func startAdvertisingSet(_ configuration: AdvertisingSetConfiguration) async throws -> AdvertisingSetID {
-        throw BluetoothError.unimplemented("Extended advertising sets not available in CoreBluetooth")
-    }
-
-    func updateAdvertisingSet(_ id: AdvertisingSetID, configuration: AdvertisingSetConfiguration) async throws {
-        throw BluetoothError.unimplemented("Extended advertising sets not available in CoreBluetooth")
-    }
-
-    func stopAdvertising() async {
+    func stopAdvertising() {
         peripheralManager.stopAdvertising()
-    }
-
-    func stopAdvertisingSet(_ id: AdvertisingSetID) async {
-        // No-op for CoreBluetooth
-    }
-
-    func disconnect(_ central: Central) async throws {
-        throw BluetoothError.unimplemented("Direct disconnect not available in CoreBluetooth peripheral role")
-    }
-
-    func removeBond(for central: Central) async throws {
-        throw BluetoothError.unimplemented("Bond removal not available in CoreBluetooth - use system Settings")
     }
 
     func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
@@ -1593,7 +1739,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         }
     }
 
-    func removeService(_ registration: GATTServiceRegistration) async throws {
+    func removeService(_ registration: GATTServiceRegistration) throws {
         guard let cbService = registeredServices[registration.service.uuid.cbuuid] else {
             throw BluetoothError.serviceNotFound("Service \(registration.service.uuid) not found")
         }
@@ -1607,13 +1753,13 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         }
     }
 
-    func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {
+    func gattRequests() -> AsyncThrowingStream<GATTServerRequest, Error> {
         AsyncThrowingStream { continuation in
             self.gattRequestsContinuation = continuation
         }
     }
 
-    func updateValue(_ value: Data, for characteristic: GATTCharacteristic, type: GATTServerUpdateType) async throws {
+    func updateValue(_ value: Data, for characteristic: GATTCharacteristic, type: GATTServerUpdateType) throws {
         guard let cbChar = characteristicMap[characteristic.uuid.cbuuid] else {
             throw BluetoothError.characteristicNotFound("Characteristic \(characteristic.uuid) not found")
         }
@@ -1635,7 +1781,7 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
         }
     }
 
-    func incomingL2CAPChannels(psm: L2CAPPSM) async throws -> AsyncThrowingStream<any L2CAPChannel, Error> {
+    func incomingL2CAPChannels(psm: L2CAPPSM) -> AsyncThrowingStream<any L2CAPChannel, Error> {
         AsyncThrowingStream { continuation in
             self.publishedL2CAPChannels[psm.rawValue] = continuation
 
@@ -1653,52 +1799,105 @@ actor _CoreBluetoothPeripheralBackend: _PeripheralBackend {
 
 // MARK: - Peripheral Manager Delegate
 
-/// Thread-safety note: Same pattern as CentralManagerDelegate - closures set once before operations begin
-private final class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate, @unchecked Sendable {
-    var onStateUpdate: (@Sendable (CBManagerState) -> Void)?
-    var onServiceAdded: (@Sendable (CBService?, Error?) -> Void)?
-    var onCentralSubscribed: (@Sendable (CBCentral, CBCharacteristic) -> Void)?
-    var onCentralUnsubscribed: (@Sendable (CBCentral, CBCharacteristic) -> Void)?
-    var onReadRequest: (@Sendable (CBATTRequest) -> Void)?
-    var onWriteRequests: (@Sendable ([CBATTRequest]) -> Void)?
-    var onL2CAPChannelPublished: (@Sendable (CBL2CAPPSM, Error?) -> Void)?
-    var onL2CAPChannelOpened: (@Sendable (CBL2CAPChannel?, Error?) -> Void)?
+private final class PeripheralManagerDelegate: NSObject, CBPeripheralManagerDelegate, Sendable {
+    private struct Callbacks: Sendable {
+        var onStateUpdate: (@Sendable (CBManagerState) -> Void)?
+        var onServiceAdded: (@Sendable (CBService?, Error?) -> Void)?
+        var onCentralSubscribed: (@Sendable (CBCentral, CBCharacteristic) -> Void)?
+        var onCentralUnsubscribed: (@Sendable (CBCentral, CBCharacteristic) -> Void)?
+        var onReadRequest: (@Sendable (CBATTRequest) -> Void)?
+        var onWriteRequests: (@Sendable ([CBATTRequest]) -> Void)?
+        var onL2CAPChannelPublished: (@Sendable (CBL2CAPPSM, Error?) -> Void)?
+        var onL2CAPChannelOpened: (@Sendable (CBL2CAPChannel?, Error?) -> Void)?
+    }
+
+    private let callbacks = Mutex(Callbacks())
+
+    var onStateUpdate: (@Sendable (CBManagerState) -> Void)? {
+        get { callbacks.withLock { $0.onStateUpdate } }
+        set { callbacks.withLock { $0.onStateUpdate = newValue } }
+    }
+
+    var onServiceAdded: (@Sendable (CBService?, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onServiceAdded } }
+        set { callbacks.withLock { $0.onServiceAdded = newValue } }
+    }
+
+    var onCentralSubscribed: (@Sendable (CBCentral, CBCharacteristic) -> Void)? {
+        get { callbacks.withLock { $0.onCentralSubscribed } }
+        set { callbacks.withLock { $0.onCentralSubscribed = newValue } }
+    }
+
+    var onCentralUnsubscribed: (@Sendable (CBCentral, CBCharacteristic) -> Void)? {
+        get { callbacks.withLock { $0.onCentralUnsubscribed } }
+        set { callbacks.withLock { $0.onCentralUnsubscribed = newValue } }
+    }
+
+    var onReadRequest: (@Sendable (CBATTRequest) -> Void)? {
+        get { callbacks.withLock { $0.onReadRequest } }
+        set { callbacks.withLock { $0.onReadRequest = newValue } }
+    }
+
+    var onWriteRequests: (@Sendable ([CBATTRequest]) -> Void)? {
+        get { callbacks.withLock { $0.onWriteRequests } }
+        set { callbacks.withLock { $0.onWriteRequests = newValue } }
+    }
+
+    var onL2CAPChannelPublished: (@Sendable (CBL2CAPPSM, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onL2CAPChannelPublished } }
+        set { callbacks.withLock { $0.onL2CAPChannelPublished = newValue } }
+    }
+
+    var onL2CAPChannelOpened: (@Sendable (CBL2CAPChannel?, Error?) -> Void)? {
+        get { callbacks.withLock { $0.onL2CAPChannelOpened } }
+        set { callbacks.withLock { $0.onL2CAPChannelOpened = newValue } }
+    }
 
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
-        onStateUpdate?(peripheral.state)
+        callbacks.withLock { $0.onStateUpdate }?(peripheral.state)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
-        onServiceAdded?(service, error)
+        callbacks.withLock { $0.onServiceAdded }?(service, error)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        onCentralSubscribed?(central, characteristic)
+        callbacks.withLock { $0.onCentralSubscribed }?(central, characteristic)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
-        onCentralUnsubscribed?(central, characteristic)
+        callbacks.withLock { $0.onCentralUnsubscribed }?(central, characteristic)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
-        onReadRequest?(request)
+        callbacks.withLock { $0.onReadRequest }?(request)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
-        onWriteRequests?(requests)
+        callbacks.withLock { $0.onWriteRequests }?(requests)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didPublishL2CAPChannel PSM: CBL2CAPPSM, error: Error?) {
-        onL2CAPChannelPublished?(PSM, error)
+        callbacks.withLock { $0.onL2CAPChannelPublished }?(PSM, error)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didOpen channel: CBL2CAPChannel?, error: Error?) {
-        onL2CAPChannelOpened?(channel, error)
+        callbacks.withLock { $0.onL2CAPChannelOpened }?(channel, error)
     }
 }
 
 // MARK: - L2CAP Channel
 
+/// CoreBluetooth L2CAP Channel implementation.
+///
+/// Thread-safety: This class uses @unchecked Sendable because:
+/// 1. Foundation's InputStream/OutputStream are not Sendable and there's no @preconcurrency import for Foundation
+/// 2. All stream operations are serialized on the main run loop (streams are scheduled on .main)
+/// 3. Mutable state (incomingContinuation, closed) is protected by Mutex
+/// 4. Stream delegate callbacks happen on main thread where streams are scheduled
+///
+/// This is the only remaining @unchecked Sendable in the CoreBluetooth backend.
+/// The delegates (CentralManagerDelegate, PeripheralDelegate, etc.) use Mutex pattern instead.
 final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     let psm: L2CAPPSM
     let mtu: Int
@@ -1709,8 +1908,9 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     private let state: Mutex<L2CAPChannelState>
     private let streamDelegate: L2CAPStreamDelegate
 
-    private struct L2CAPChannelState {
+    private struct L2CAPChannelState: Sendable {
         var incomingContinuation: AsyncThrowingStream<Data, Error>.Continuation?
+        var closed: Bool = false
     }
 
     init(channel: CBL2CAPChannel) {
@@ -1719,8 +1919,8 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
         // Use a reasonable default MTU for L2CAP CoC (Connection-oriented Channels)
         // The actual MTU is negotiated during channel setup, but we use a conservative default
         self.mtu = 512
-        self.inputStream = channel.inputStream
-        self.outputStream = channel.outputStream
+        self.inputStream = channel.inputStream!
+        self.outputStream = channel.outputStream!
         self.state = Mutex(L2CAPChannelState())
 
         let delegate = L2CAPStreamDelegate()
@@ -1745,14 +1945,15 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     }
 
     private func readAvailableData() {
+        let isClosed = state.withLock { $0.closed }
+        guard !isClosed else { return }
+
         var buffer = [UInt8](repeating: 0, count: 4096)
         let bytesRead = inputStream.read(&buffer, maxLength: buffer.count)
 
         if bytesRead > 0 {
             let data = Data(buffer.prefix(bytesRead))
-            _ = state.withLock { state in
-                state.incomingContinuation?.yield(data)
-            }
+            _ = state.withLock { $0.incomingContinuation?.yield(data) }
         }
     }
 
@@ -1764,6 +1965,11 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     }
 
     func send(_ data: Data) async throws {
+        let isClosed = state.withLock { $0.closed }
+        guard !isClosed else {
+            throw BluetoothError.l2capChannelError("Channel closed")
+        }
+
         guard outputStream.hasSpaceAvailable else {
             throw BluetoothError.l2capChannelError("Output stream not available")
         }
@@ -1779,25 +1985,19 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
 
     func incoming() -> AsyncThrowingStream<Data, Error> {
         AsyncThrowingStream { continuation in
-            self.state.withLock { state in
-                state.incomingContinuation = continuation
-            }
+            self.state.withLock { $0.incomingContinuation = continuation }
 
             continuation.onTermination = { [weak self] _ in
                 guard let self else { return }
-                self.state.withLock { state in
-                    state.incomingContinuation = nil
-                }
+                self.state.withLock { $0.incomingContinuation = nil }
             }
         }
     }
 
     func close() async {
-        closeStreams()
-    }
-
-    private func closeStreams() {
         state.withLock { state in
+            guard !state.closed else { return }
+            state.closed = true
             state.incomingContinuation?.finish()
             state.incomingContinuation = nil
         }
@@ -1809,18 +2009,31 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
 
 // MARK: - L2CAP Stream Delegate
 
-/// Thread-safety note: Same pattern - closures set once during init before streams are opened
-private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, @unchecked Sendable {
-    var onDataAvailable: (() -> Void)?
-    var onError: ((Error) -> Void)?
+private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, Sendable {
+    private struct Callbacks: Sendable {
+        var onDataAvailable: (@Sendable () -> Void)?
+        var onError: (@Sendable (Error) -> Void)?
+    }
+
+    private let callbacks = Mutex(Callbacks())
+
+    var onDataAvailable: (@Sendable () -> Void)? {
+        get { callbacks.withLock { $0.onDataAvailable } }
+        set { callbacks.withLock { $0.onDataAvailable = newValue } }
+    }
+
+    var onError: (@Sendable (Error) -> Void)? {
+        get { callbacks.withLock { $0.onError } }
+        set { callbacks.withLock { $0.onError = newValue } }
+    }
 
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
         switch eventCode {
         case .hasBytesAvailable:
-            onDataAvailable?()
+            callbacks.withLock { $0.onDataAvailable }?()
         case .errorOccurred:
             if let error = aStream.streamError {
-                onError?(error)
+                callbacks.withLock { $0.onError }?(error)
             }
         default:
             break

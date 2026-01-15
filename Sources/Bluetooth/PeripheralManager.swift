@@ -15,12 +15,12 @@ public actor PeripheralManager {
         self.backend = backend
     }
 
-    public func state() async -> BluetoothState {
-        await backend.state
+    public func state() -> BluetoothState {
+        backend.state
     }
 
-    public func stateUpdates() async -> AsyncStream<BluetoothState> {
-        await backend.stateUpdates()
+    public func stateUpdates() -> AsyncStream<BluetoothState> {
+        backend.stateUpdates()
     }
 
     public func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {

@@ -4,7 +4,7 @@ import FoundationEssentials
 import Foundation
 #endif
 
-protocol _CentralBackend: Actor {
+protocol _CentralBackend: Sendable {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
     func stopScan() async throws
@@ -22,7 +22,7 @@ protocol _CentralBackend: Actor {
     ) async throws -> any _PeripheralConnectionBackend
 }
 
-protocol _PeripheralBackend: Actor {
+protocol _PeripheralBackend: Sendable {
     var state: BluetoothState { get }
     func stateUpdates() -> AsyncStream<BluetoothState>
     func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error>

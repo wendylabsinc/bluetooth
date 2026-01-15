@@ -4,7 +4,7 @@ import FoundationEssentials
 import Foundation
 #endif
 
-actor _UnsupportedCentralBackend: _CentralBackend {
+struct _UnsupportedCentralBackend: _CentralBackend {
     var state: BluetoothState { .unsupported }
 
     func stateUpdates() -> AsyncStream<BluetoothState> {
@@ -46,7 +46,7 @@ actor _UnsupportedCentralBackend: _CentralBackend {
     }
 }
 
-actor _UnsupportedPeripheralBackend: _PeripheralBackend {
+struct _UnsupportedPeripheralBackend: _PeripheralBackend {
     var state: BluetoothState { .unsupported }
 
     func stateUpdates() -> AsyncStream<BluetoothState> {
