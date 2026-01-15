@@ -6,11 +6,11 @@ import PackageDescription
 let package = Package(
     name: "Bluetooth",
     platforms: [
-        .iOS("26.0"),
-        .macOS("26.0"),
-        .tvOS("26.0"),
-        .watchOS("26.0"),
-        .visionOS("26.0"),
+        .iOS(.v18),
+        .macOS(.v15),
+        .tvOS(.v18),
+        .watchOS(.v11),
+        .visionOS(.v2),
     ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.

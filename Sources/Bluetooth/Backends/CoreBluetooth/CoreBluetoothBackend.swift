@@ -1907,6 +1907,7 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     private let outputStream: OutputStream
     private let state: Mutex<L2CAPChannelState>
     private let streamDelegate: L2CAPStreamDelegate
+    private let runLoopThread: L2CAPRunLoopThread
 
     private struct L2CAPChannelState: Sendable {
         var incomingContinuation: AsyncThrowingStream<Data, Error>.Continuation?
@@ -1926,14 +1927,25 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
         let delegate = L2CAPStreamDelegate()
         self.streamDelegate = delegate
 
+        // Create a dedicated thread with run loop for stream processing
+        // This is necessary because CLI tools using async/await don't pump the main run loop
+        let thread = L2CAPRunLoopThread()
+        self.runLoopThread = thread
+        thread.start()
+
+        // Wait for run loop to be ready
+        thread.waitUntilReady()
+
         inputStream.delegate = delegate
         outputStream.delegate = delegate
 
-        inputStream.schedule(in: .main, forMode: .default)
-        outputStream.schedule(in: .main, forMode: .default)
-
-        inputStream.open()
-        outputStream.open()
+        // Schedule streams on the dedicated run loop thread
+        thread.perform {
+            self.inputStream.schedule(in: .current, forMode: .default)
+            self.outputStream.schedule(in: .current, forMode: .default)
+            self.inputStream.open()
+            self.outputStream.open()
+        }
 
         delegate.onDataAvailable = { [weak self] in
             self?.readAvailableData()
@@ -2002,8 +2014,11 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
             state.incomingContinuation = nil
         }
 
-        inputStream.close()
-        outputStream.close()
+        runLoopThread.perform {
+            self.inputStream.close()
+            self.outputStream.close()
+        }
+        runLoopThread.stop()
     }
 }
 
@@ -2037,6 +2052,57 @@ private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, Se
             }
         default:
             break
+        }
+    }
+}
+
+// MARK: - L2CAP Run Loop Thread
+
+/// A dedicated thread with its own run loop for processing L2CAP streams.
+/// This is necessary because CLI tools using async/await don't pump the main run loop,
+/// but Foundation streams require a running run loop to process I/O events.
+private final class L2CAPRunLoopThread: Thread, @unchecked Sendable {
+    private let readySemaphore = DispatchSemaphore(value: 0)
+    private var runLoop: RunLoop?
+    private let stopSource = Mutex<CFRunLoopSource?>(nil)
+
+    override func main() {
+        runLoop = .current
+
+        // Create a source to allow stopping the run loop
+        var context = CFRunLoopSourceContext()
+        context.perform = { _ in }
+        let source = CFRunLoopSourceCreate(nil, 0, &context)!
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
+        stopSource.withLock { $0 = source }
+
+        // Signal that run loop is ready
+        readySemaphore.signal()
+
+        // Run the loop until stopped
+        CFRunLoopRun()
+    }
+
+    func waitUntilReady() {
+        readySemaphore.wait()
+    }
+
+    func perform(_ block: @escaping () -> Void) {
+        guard let runLoop else { return }
+        runLoop.perform(block)
+    }
+
+    func stop() {
+        let source = stopSource.withLock { source -> CFRunLoopSource? in
+            let s = source
+            source = nil
+            return s
+        }
+        if let source {
+            CFRunLoopSourceInvalidate(source)
+        }
+        if let cfRunLoop = runLoop?.getCFRunLoop() {
+            CFRunLoopStop(cfRunLoop)
         }
     }
 }

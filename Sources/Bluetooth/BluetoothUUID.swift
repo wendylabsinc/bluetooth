@@ -18,13 +18,14 @@ extension BluetoothUUID: CustomStringConvertible {
     public var description: String {
         switch self {
         case .bit16(let value):
-            let hex = String(value, radix: 16, uppercase: true)
+            let hex = String(value, radix: 16, uppercase: false)
             return String(repeating: "0", count: max(0, 4 - hex.count)) + hex
         case .bit32(let value):
-            let hex = String(value, radix: 16, uppercase: true)
+            let hex = String(value, radix: 16, uppercase: false)
             return String(repeating: "0", count: max(0, 8 - hex.count)) + hex
         case .bit128(let value):
-            return value.uuidString.uppercased()
+            // BlueZ expects lowercase UUIDs
+            return value.uuidString.lowercased()
         }
     }
 }

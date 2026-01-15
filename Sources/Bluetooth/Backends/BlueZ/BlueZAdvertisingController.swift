@@ -138,6 +138,10 @@ actor _BlueZAdvertisingController {
         }
 
         let properties = buildProperties(config: config)
+        logger.info("Advertisement properties", metadata: [
+            "propertyCount": "\(properties.count)",
+            "propertyNames": "\(properties.map { $0.name }.joined(separator: ", "))"
+        ])
         let iface = DBusObjectServer.Interface(
             name: "org.bluez.LEAdvertisement1",
             methods: [release],
@@ -247,7 +251,8 @@ actor _BlueZAdvertisingController {
             body: [
                 .objectPath(path),
                 .dictionary([:]),
-            ]
+            ],
+            signature: "oa{sv}"  // Explicitly specify signature for empty dictionary
         )
     }
 
@@ -304,6 +309,9 @@ actor _BlueZAdvertisingController {
 
         if !config.data.serviceUUIDs.isEmpty {
             let values = config.data.serviceUUIDs.map { DBusValue.string($0.description) }
+            logger.debug("Adding ServiceUUIDs to advertisement", metadata: [
+                "uuids": "\(config.data.serviceUUIDs.map { $0.description }.joined(separator: ", "))"
+            ])
             properties.append(.init(name: "ServiceUUIDs", value: .array(values)))
         }
 
