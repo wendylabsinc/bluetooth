@@ -26,7 +26,7 @@
     private var connection: DBusClient.Connection?
     private var objectServer: DBusObjectServer?
     private var connectionTask: Task<Void, Error>?
-    private var connectionContinuation: CheckedContinuation<DBusClient.Connection, Error>?
+    private var connectionContinuations: [CheckedContinuation<DBusClient.Connection, Error>] = []
     private var messageHandlers: [UUID: @Sendable (DBusMessage) async -> Void] = [:]
     private var isConnecting = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
@@ -44,9 +44,9 @@
 
       if isConnecting {
         logger.trace("Connection in progress, waiting...")
-        // Wait for existing connection attempt
+        // Wait for existing connection attempt - multiple waiters are supported
         return try await withCheckedThrowingContinuation { continuation in
-          connectionContinuation = continuation
+          connectionContinuations.append(continuation)
         }
       }
 
@@ -80,7 +80,7 @@
 
       // Wait for connection to be established
       return try await withCheckedThrowingContinuation { continuation in
-        connectionContinuation = continuation
+        connectionContinuations.append(continuation)
       }
     }
 
@@ -155,7 +155,12 @@
       let (stream, continuation) = AsyncStream<DBusMessage>.makeStream()
       messageContinuation = continuation
 
-      // Set a simple message handler that yields to the stream (no weak captures)
+      // Set a message handler that yields messages to the stream.
+      // NOTE: We intentionally capture `continuation` strongly here. AsyncStream.Continuation
+      // is a value-like handle to the stream and does not retain the DBusClient.Connection,
+      // so this does not introduce a retain cycle. The lifetime of the continuation is
+      // explicitly bounded: shutdown() calls messageContinuation?.finish() and clears it,
+      // which terminates the stream and releases any associated resources.
       await conn.setMessageHandler { [logger] message in
         logger.debug(
           "BlueZClient received D-Bus message",
@@ -170,9 +175,11 @@
 
       logger.info("D-Bus connection established")
 
-      if let connContinuation = connectionContinuation {
-        connectionContinuation = nil
-        connContinuation.resume(returning: conn)
+      // Resume all waiting continuations
+      let continuations = connectionContinuations
+      connectionContinuations.removeAll()
+      for continuation in continuations {
+        continuation.resume(returning: conn)
       }
 
       // Run the message handling loop
@@ -192,13 +199,22 @@
             "path": "\(message.path ?? "nil")",
             "member": "\(message.member ?? "nil")",
           ])
-        // First, let the object server handle method calls (Introspect, GetAll, etc.)
-        // This is critical for RegisterAdvertisement to work - BlueZ needs to introspect
-        // the advertisement object before responding
+        // First, let the object server handle method calls (Introspect, GetAll, etc.).
+        // The object server exposes standard D-Bus introspection interfaces that BlueZ
+        // calls as part of RegisterAdvertisement. BlueZ will typically:
+        //   1. Call Introspect/GetAll on the advertisement object path to discover its
+        //      interfaces and properties.
+        //   2. Only then complete the RegisterAdvertisement call.
+        //
+        // If we ran user-registered handlers first, they could delay or interfere with
+        // these method calls. To avoid this, we always give the object server the first
+        // chance to handle each message.
         await server.handle(message: message)
         logger.trace("BlueZClient finished server.handle")
 
-        // Then let any registered handlers also see the message (for signals, etc.)
+        // Then let any registered handlers also see the message (for signals, logging,
+        // higher-level state updates, etc.). They observe the message after the core
+        // D-Bus semantics (introspection, property access, etc.) have been applied.
         await handleMessage(message)
       }
       logger.debug("BlueZClient run loop ended")
@@ -225,6 +241,13 @@
       objectServer = nil
       messageHandlers.removeAll()
       isConnecting = false
+
+      // Fail any pending connection waiters
+      let pendingContinuations = connectionContinuations
+      connectionContinuations.removeAll()
+      for continuation in pendingContinuations {
+        continuation.resume(throwing: BluetoothError.invalidState("D-Bus client shutdown"))
+      }
 
       // Finish the message stream to stop the run loop
       messageContinuation?.finish()

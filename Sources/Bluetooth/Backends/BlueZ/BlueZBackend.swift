@@ -319,7 +319,8 @@
       any L2CAPChannel, Error
     > {
       let listener = try await l2capManager.startAccepting(psm: psm)
-      return AsyncThrowingStream { continuation in
+      // Capture l2capManager explicitly to ensure proper cleanup when the stream terminates
+      return AsyncThrowingStream { [l2capManager] continuation in
         continuation.onTermination = { _ in
           Task { await l2capManager.stop(psm: psm) }
         }

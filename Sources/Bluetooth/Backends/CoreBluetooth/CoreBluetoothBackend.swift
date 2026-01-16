@@ -116,8 +116,10 @@
 
   // MARK: - Sendable Wrappers for CoreBluetooth Types
   // These wrappers are necessary because CoreBluetooth types are not Sendable.
-  // With @preconcurrency import, we can wrap them in Sendable structs.
-  // Safety: CoreBluetooth objects are thread-safe when accessed from their designated queue (.main)
+  // With @preconcurrency import, we can wrap references in Sendable structs so they can
+  // cross Swift concurrency isolation boundaries. This does NOT make CoreBluetooth
+  // objects thread-safe: they must still only be accessed on the dispatch queue they
+  // were created/associated with (typically the main queue).
 
   @usableFromInline
   struct SendablePeripheral: Sendable {
@@ -270,6 +272,11 @@
       Task { await setupDelegateCallbacks() }
     }
 
+    /// Bridges CoreBluetooth delegate callbacks to the actor.
+    /// Uses unstructured Tasks to transition from synchronous delegate callbacks to async actor methods.
+    /// Safety: Each callback uses `[weak self]` to avoid retaining the actor, and the `guard let self`
+    /// ensures operations complete quickly when the actor is deallocated. These Tasks perform minimal
+    /// work (yielding to continuations or updating state) and don't require explicit cancellation.
     private func setupDelegateCallbacks() {
       delegate.onStateUpdate = { [weak self] state in
         guard let self else { return }
@@ -2044,8 +2051,19 @@
       // Use a reasonable default MTU for L2CAP CoC (Connection-oriented Channels)
       // The actual MTU is negotiated during channel setup, but we use a conservative default
       self.mtu = 512
-      self.inputStream = channel.inputStream!
-      self.outputStream = channel.outputStream!
+
+      // CBL2CAPChannel should always have valid streams when opened successfully.
+      // If these are nil, it indicates a CoreBluetooth bug or that the channel was
+      // passed before being fully opened.
+      guard let inputStream = channel.inputStream,
+        let outputStream = channel.outputStream
+      else {
+        preconditionFailure(
+          "CBL2CAPChannel has nil streams for PSM \(channel.psm). "
+            + "This indicates a CoreBluetooth issue or premature channel access.")
+      }
+      self.inputStream = inputStream
+      self.outputStream = outputStream
       self.state = Mutex(L2CAPChannelState())
 
       let delegate = L2CAPStreamDelegate()

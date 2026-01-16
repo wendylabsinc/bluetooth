@@ -243,6 +243,9 @@
     }
 
     private static func createSocket() throws -> Int32 {
+      // NOTE: On Glibc, SOCK_SEQPACKET is imported as an enum-like type requiring
+      // `.rawValue` to get the CInt value. On Musl, it's imported directly as a
+      // CInt-compatible constant. We normalize both to Int32 for the socket() call.
       #if canImport(Glibc)
         let socketType = Int32(SOCK_SEQPACKET.rawValue)
       #elseif canImport(Musl)

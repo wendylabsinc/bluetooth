@@ -219,6 +219,9 @@
       pendingExecuteByCentral.removeAll()
     }
 
+    /// Ensures the GATT application object is exported.
+    /// Thread-safety: Actor isolation guarantees this method runs serially,
+    /// so concurrent calls cannot race on the `isStarted` check.
     private func ensureStarted() async throws {
       if isStarted {
         return

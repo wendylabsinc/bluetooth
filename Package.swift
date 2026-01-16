@@ -67,6 +67,9 @@ let package = Package(
       dependencies: [
         .product(name: "DBUS", package: "dbus", condition: .when(platforms: [.linux])),
         .product(name: "NIOCore", package: "swift-nio", condition: .when(platforms: [.linux])),
+        .product(name: "NIOPosix", package: "swift-nio", condition: .when(platforms: [.linux])),
+        .product(
+          name: "NIOFoundationCompat", package: "swift-nio", condition: .when(platforms: [.linux])),
         .product(name: "Logging", package: "swift-log"),
       ],
       swiftSettings: [
