@@ -9,9 +9,9 @@ import SwiftUI
 
 @main
 struct BluetoothCompanionAppApp: App {
-    var body: some Scene {
-        WindowGroup {
-            DevicesListPage()
-        }
+  var body: some Scene {
+    WindowGroup {
+      DevicesListPage()
     }
+  }
 }

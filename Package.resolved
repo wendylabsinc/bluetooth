@@ -1,13 +1,13 @@
 {
-  "originHash" : "f7d0dd919cc6063a6bade31f688c36e6439d944249622b4a7e7a666cea27b061",
+  "originHash" : "6236a18eb44fb430d7966f40cce5e43b9c64cd3bb491a4396f7f3f9fc6911d51",
   "pins" : [
     {
       "identity" : "dbus",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/wendylabsinc/dbus.git",
       "state" : {
-        "branch" : "feature/dbus-hardening",
-        "revision" : "764c3c04959e04d6b0ab80452a9de79caf2185c1"
+        "revision" : "4d88300754c806827d919c5274cbfc18baebe9ab",
+        "version" : "0.3.0"
       }
     },
     {

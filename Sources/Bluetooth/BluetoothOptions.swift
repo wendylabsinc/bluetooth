@@ -1,21 +1,21 @@
 #if canImport(FoundationEssentials)
-import FoundationEssentials
+  import FoundationEssentials
 #else
-import Foundation
+  import Foundation
 #endif
 
 public struct BluetoothAdapter: Hashable, Sendable, Codable {
-    public var identifier: String
+  public var identifier: String
 
-    public init(_ identifier: String) {
-        self.identifier = identifier
-    }
+  public init(_ identifier: String) {
+    self.identifier = identifier
+  }
 }
 
 public struct BluetoothOptions: Hashable, Sendable, Codable {
-    public var adapter: BluetoothAdapter?
+  public var adapter: BluetoothAdapter?
 
-    public init(adapter: BluetoothAdapter? = nil) {
-        self.adapter = adapter
-    }
+  public init(adapter: BluetoothAdapter? = nil) {
+    self.adapter = adapter
+  }
 }
