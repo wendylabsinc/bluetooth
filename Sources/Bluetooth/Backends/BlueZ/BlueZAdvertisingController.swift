@@ -60,7 +60,7 @@ actor _BlueZAdvertisingController {
         isAdvertising = true
         stopRequested = false
 
-        logger.info("Starting advertising", metadata: [
+        logger.debug("Starting advertising", metadata: [
             BluetoothLogMetadata.advertisementPath: "\(path)",
             "type": "\(parameters.isConnectable ? "peripheral" : "broadcast")",
             "includeTxPower": "\(parameters.includeTxPower)"
@@ -105,6 +105,15 @@ actor _BlueZAdvertisingController {
             let connection = try await client.getConnection()
             let server = try await client.getObjectServer()
 
+            // Ensure the adapter is powered on before advertising
+            try await ensureAdapterPowered(connection)
+
+            // Proactively try to clean up any stale advertisement from a crashed process
+            // This is a no-op if nothing is registered at this path
+            logger.debug("Cleaning up any stale advertisement at path")
+            try? await unregisterAdvertisement(connection, path: config.path)
+            await server.unexport(path: config.path)
+
             let object = makeAdvertisementObject(config: config)
             await server.export(object)
 
@@ -112,7 +121,7 @@ actor _BlueZAdvertisingController {
                 BluetoothLogMetadata.advertisementPath: "\(config.path)"
             ])
             try await registerAdvertisement(connection, path: config.path)
-            logger.info("Advertisement registered successfully")
+            logger.debug("Advertisement registered successfully")
 
             await resumeStartIfNeeded()
             await waitForStop()
@@ -120,7 +129,7 @@ actor _BlueZAdvertisingController {
             logger.debug("Unregistering advertisement")
             try await unregisterAdvertisement(connection, path: config.path)
             await server.unexport(path: config.path)
-            logger.info("Advertisement stopped")
+            logger.debug("Advertisement stopped")
         } catch {
             logger.error("Advertising failed", metadata: [
                 BluetoothLogMetadata.error: "\(error)"
@@ -138,7 +147,7 @@ actor _BlueZAdvertisingController {
         }
 
         let properties = buildProperties(config: config)
-        logger.info("Advertisement properties", metadata: [
+        logger.debug("Advertisement properties", metadata: [
             "propertyCount": "\(properties.count)",
             "propertyNames": "\(properties.map { $0.name }.joined(separator: ", "))"
         ])
@@ -169,6 +178,19 @@ actor _BlueZAdvertisingController {
 
                 if let reply, reply.messageType == .error {
                     let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+
+                    // If AlreadyExists, try to unregister from BlueZ and retry on any attempt
+                    // Note: We don't need to re-export the D-Bus object - it's already exported
+                    // We just need to tell BlueZ to forget its stale registration
+                    if name == "org.bluez.Error.AlreadyExists" && attempt < registerMaxAttempts {
+                        logger.debug("Stale advertisement found, unregistering from BlueZ before retry", metadata: [
+                            BluetoothLogMetadata.attempt: "\(attempt)"
+                        ])
+                        try? await unregisterAdvertisement(connection, path: path)
+                        try await Task.sleep(nanoseconds: registerRetryDelayNanos)
+                        continue
+                    }
+
                     throw BluetoothError.invalidState("D-Bus RegisterAdvertisement failed: \(name)")
                 }
                 logger.trace("RegisterAdvertisement succeeded", metadata: [
@@ -305,6 +327,9 @@ actor _BlueZAdvertisingController {
 
         if let name = config.data.localName, !name.isEmpty {
             properties.append(.init(name: "LocalName", value: .string(name)))
+            logger.debug("Advertisement LocalName set", metadata: ["name": "\(name)"])
+        } else {
+            logger.warning("Advertisement has no LocalName - device may not be discoverable by name")
         }
 
         if !config.data.serviceUUIDs.isEmpty {
@@ -395,8 +420,61 @@ actor _BlueZAdvertisingController {
     }
 
     private func makeAdvertisementPath() -> String {
-        let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        return "/org/wendylabsinc/bluetooth/advertisement\(suffix)"
+        // Use a fixed path so we can clean up stale advertisements from crashed processes
+        // The path is tied to the adapter to support multiple adapters
+        let adapterSuffix = adapterPath.replacingOccurrences(of: "/", with: "_")
+        return "/org/wendylabsinc/bluetooth/advertisement\(adapterSuffix)"
+    }
+
+    private func ensureAdapterPowered(_ connection: DBusClient.Connection) async throws {
+        // First check if adapter is already powered
+        let getRequest = DBusRequest.createMethodCall(
+            destination: client.busName,
+            path: adapterPath,
+            interface: "org.freedesktop.DBus.Properties",
+            method: "Get",
+            body: [
+                .string("org.bluez.Adapter1"),
+                .string("Powered")
+            ]
+        )
+
+        if let reply = try await connection.send(getRequest),
+           reply.messageType == .methodReturn,
+           let body = reply.body.first,
+           case .variant(let variant) = body,
+           case .boolean(let powered) = variant.value,
+           powered {
+            logger.debug("Adapter is already powered on")
+            return
+        }
+
+        // Power on the adapter
+        logger.info("Powering on Bluetooth adapter")
+        let setRequest = DBusRequest.createMethodCall(
+            destination: client.busName,
+            path: adapterPath,
+            interface: "org.freedesktop.DBus.Properties",
+            method: "Set",
+            body: [
+                .string("org.bluez.Adapter1"),
+                .string("Powered"),
+                .variant(DBusVariant(.boolean(true)))
+            ]
+        )
+
+        if let reply = try await connection.send(setRequest),
+           reply.messageType == .error {
+            let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
+            logger.error("Failed to power on adapter", metadata: [
+                BluetoothLogMetadata.error: "\(name)"
+            ])
+            throw BluetoothError.invalidState("Failed to power on Bluetooth adapter: \(name)")
+        }
+
+        // Wait a moment for the adapter to power up
+        try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+        logger.debug("Adapter powered on successfully")
     }
 
     private func cleanup() {

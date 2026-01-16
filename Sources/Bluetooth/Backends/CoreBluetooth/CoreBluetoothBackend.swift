@@ -1,5 +1,6 @@
 #if canImport(CoreBluetooth)
 @preconcurrency import CoreBluetooth
+import Logging
 import Synchronization
 #if canImport(FoundationEssentials)
 import FoundationEssentials
@@ -1908,9 +1909,11 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     private let state: Mutex<L2CAPChannelState>
     private let streamDelegate: L2CAPStreamDelegate
     private let runLoopThread: L2CAPRunLoopThread
+    private let logger = BluetoothLogger.l2cap
 
     private struct L2CAPChannelState: Sendable {
         var incomingContinuation: AsyncThrowingStream<Data, Error>.Continuation?
+        var spaceAvailableContinuation: CheckedContinuation<Void, Never>?
         var closed: Bool = false
     }
 
@@ -1951,9 +1954,22 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
             self?.readAvailableData()
         }
 
+        delegate.onSpaceAvailable = { [weak self] in
+            self?.handleSpaceAvailable()
+        }
+
         delegate.onError = { [weak self] error in
             self?.handleStreamError(error)
         }
+    }
+
+    private func handleSpaceAvailable() {
+        let continuation = state.withLock { state in
+            let c = state.spaceAvailableContinuation
+            state.spaceAvailableContinuation = nil
+            return c
+        }
+        continuation?.resume()
     }
 
     private func readAvailableData() {
@@ -1982,16 +1998,47 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
             throw BluetoothError.l2capChannelError("Channel closed")
         }
 
-        guard outputStream.hasSpaceAvailable else {
-            throw BluetoothError.l2capChannelError("Output stream not available")
-        }
+        // Try to write directly - for L2CAP channels, hasSpaceAvailable may not work as expected
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            runLoopThread.perform {
+                let status = self.outputStream.streamStatus
+                let hasSpace = self.outputStream.hasSpaceAvailable
+                self.logger.trace("Attempting write", metadata: [
+                    BluetoothLogMetadata.psm: "\(self.psm.rawValue)",
+                    "streamStatus": "\(status.rawValue)",
+                    "hasSpace": "\(hasSpace)",
+                    BluetoothLogMetadata.bytesCount: "\(data.count)"
+                ])
 
-        let bytesWritten = data.withUnsafeBytes { buffer in
-            outputStream.write(buffer.bindMemory(to: UInt8.self).baseAddress!, maxLength: data.count)
-        }
+                // Only check that stream is open, don't require hasSpaceAvailable
+                guard status == .open else {
+                    self.logger.debug("Stream not open", metadata: [
+                        "streamStatus": "\(status.rawValue)"
+                    ])
+                    continuation.resume(throwing: BluetoothError.l2capChannelError("Output stream not open (status=\(status.rawValue))"))
+                    return
+                }
 
-        if bytesWritten < 0 {
-            throw BluetoothError.l2capChannelError("Failed to write to L2CAP channel")
+                let bytesWritten = data.withUnsafeBytes { buffer in
+                    self.outputStream.write(buffer.bindMemory(to: UInt8.self).baseAddress!, maxLength: data.count)
+                }
+
+                if bytesWritten < 0 {
+                    let streamError = self.outputStream.streamError
+                    self.logger.debug("Write failed", metadata: [
+                        BluetoothLogMetadata.error: "\(String(describing: streamError))"
+                    ])
+                    continuation.resume(throwing: BluetoothError.l2capChannelError("Failed to write to L2CAP channel"))
+                } else if bytesWritten == 0 {
+                    self.logger.debug("Wrote 0 bytes - stream may not be ready")
+                    continuation.resume(throwing: BluetoothError.l2capChannelError("Wrote 0 bytes - stream may not be ready"))
+                } else {
+                    self.logger.trace("Write succeeded", metadata: [
+                        BluetoothLogMetadata.bytesCount: "\(bytesWritten)"
+                    ])
+                    continuation.resume()
+                }
+            }
         }
     }
 
@@ -2027,6 +2074,7 @@ final class _CoreBluetoothL2CAPChannel: L2CAPChannel, @unchecked Sendable {
 private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, Sendable {
     private struct Callbacks: Sendable {
         var onDataAvailable: (@Sendable () -> Void)?
+        var onSpaceAvailable: (@Sendable () -> Void)?
         var onError: (@Sendable (Error) -> Void)?
     }
 
@@ -2035,6 +2083,11 @@ private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, Se
     var onDataAvailable: (@Sendable () -> Void)? {
         get { callbacks.withLock { $0.onDataAvailable } }
         set { callbacks.withLock { $0.onDataAvailable = newValue } }
+    }
+
+    var onSpaceAvailable: (@Sendable () -> Void)? {
+        get { callbacks.withLock { $0.onSpaceAvailable } }
+        set { callbacks.withLock { $0.onSpaceAvailable = newValue } }
     }
 
     var onError: (@Sendable (Error) -> Void)? {
@@ -2046,6 +2099,8 @@ private final class L2CAPStreamDelegate: NSObject, Foundation.StreamDelegate, Se
         switch eventCode {
         case .hasBytesAvailable:
             callbacks.withLock { $0.onDataAvailable }?()
+        case .hasSpaceAvailable:
+            callbacks.withLock { $0.onSpaceAvailable }?()
         case .errorOccurred:
             if let error = aStream.streamError {
                 callbacks.withLock { $0.onError }?(error)

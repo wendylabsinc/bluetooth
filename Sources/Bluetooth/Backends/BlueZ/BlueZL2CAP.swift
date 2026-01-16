@@ -6,6 +6,10 @@ import Foundation
 import Foundation
 #endif
 
+import Logging
+import NIOCore
+import NIOPosix
+
 #if canImport(Glibc)
 import Glibc
 private let system_close = Glibc.close
@@ -19,6 +23,8 @@ private let system_connect = Musl.connect
 private let system_bind = Musl.bind
 private let system_send = Musl.send
 #endif
+
+private let logger = BluetoothLogger.l2cap
 
 enum BlueZAddressType: UInt8, Sendable {
     case `public` = 0x01
@@ -49,9 +55,18 @@ enum BlueZL2CAP {
         var lastError: BluetoothError?
 
         for addressType in addressTypes {
+            logger.trace("Trying to bind listener", metadata: [
+                "addressType": "\(addressType)"
+            ])
             let fd = try createSocket()
+
             switch bindAndListen(fd: fd, addressType: addressType) {
             case .success(let psm):
+                logger.debug("L2CAP listener created", metadata: [
+                    BluetoothLogMetadata.psm: "\(psm.rawValue)",
+                    "addressType": "\(addressType)",
+                    "fd": "\(fd)"
+                ])
                 return Listener(fd: fd, psm: psm, parameters: parameters, addressType: addressType)
             case .failure(let err):
                 closeSocket(fd)
@@ -100,6 +115,12 @@ enum BlueZL2CAP {
             }
 
             let mtus = readMTU(fd: clientFD)
+            logger.debug("Accepted L2CAP connection", metadata: [
+                BluetoothLogMetadata.psm: "\(listener.psm.rawValue)",
+                "fd": "\(clientFD)",
+                "outgoingMTU": "\(mtus.outgoing)",
+                "incomingMTU": "\(mtus.incoming)"
+            ])
             let channel = BlueZL2CAPChannel(
                 fd: clientFD,
                 psm: listener.psm,
@@ -168,6 +189,12 @@ enum BlueZL2CAP {
                 try applySecurityIfNeeded(fd: fd, parameters: parameters)
                 try connect(fd: fd, address: parsedAddress, addressType: addressType, psm: psm)
                 let mtus = readMTU(fd: fd)
+                logger.debug("Connected L2CAP channel", metadata: [
+                    BluetoothLogMetadata.psm: "\(psm.rawValue)",
+                    BluetoothLogMetadata.deviceAddress: "\(address)",
+                    "outgoingMTU": "\(mtus.outgoing)",
+                    "incomingMTU": "\(mtus.incoming)"
+                ])
                 return BlueZL2CAPChannel(
                     fd: fd,
                     psm: psm,
@@ -248,6 +275,34 @@ enum BlueZL2CAP {
             return .failure(errno)
         }
 
+        // Set BT_RCVMTU AFTER bind - this is critical for BLE L2CAP CoC
+        // The socket must be bound to an LE address type first before the kernel
+        // recognizes it as a BLE socket and accepts the MTU setting.
+        var mtu: UInt16 = 672
+        _ = withUnsafePointer(to: &mtu) { ptr in
+            setsockopt(
+                fd,
+                BlueZL2CAPConstants.solBluetooth,
+                BlueZL2CAPConstants.btRcvMTU,
+                ptr,
+                socklen_t(MemoryLayout<UInt16>.size)
+            )
+        }
+
+        // Also try setting L2CAP_OPTIONS.imtu for classic L2CAP compatibility
+        var options = l2cap_options()
+        options.imtu = mtu
+        options.omtu = mtu
+        _ = withUnsafePointer(to: &options) { ptr in
+            setsockopt(
+                fd,
+                BlueZL2CAPConstants.solL2CAP,
+                BlueZL2CAPConstants.l2capOptions,
+                ptr,
+                socklen_t(MemoryLayout<l2cap_options>.size)
+            )
+        }
+
         if listen(fd, BlueZL2CAPConstants.listenBacklog) != 0 {
             return .failure(errno)
         }
@@ -309,6 +364,28 @@ enum BlueZL2CAP {
     }
 
     private static func readMTU(fd: Int32) -> (outgoing: Int, incoming: Int) {
+        // Try BLE L2CAP CoC socket options first (BT_RCVMTU/BT_SNDMTU)
+        var rcvMtu: UInt16 = 0
+        var sndMtu: UInt16 = 0
+        var rcvLen = socklen_t(MemoryLayout<UInt16>.size)
+        var sndLen = socklen_t(MemoryLayout<UInt16>.size)
+
+        let rcvResult = withUnsafeMutablePointer(to: &rcvMtu) { ptr in
+            getsockopt(fd, BlueZL2CAPConstants.solBluetooth, BlueZL2CAPConstants.btRcvMTU, ptr, &rcvLen)
+        }
+        let sndResult = withUnsafeMutablePointer(to: &sndMtu) { ptr in
+            getsockopt(fd, BlueZL2CAPConstants.solBluetooth, BlueZL2CAPConstants.btSndMTU, ptr, &sndLen)
+        }
+
+        if rcvResult == 0 && sndResult == 0 && rcvMtu > 0 && sndMtu > 0 {
+            logger.trace("BLE CoC MTU negotiated", metadata: [
+                "receiveMTU": "\(rcvMtu)",
+                "sendMTU": "\(sndMtu)"
+            ])
+            return (Int(sndMtu), Int(rcvMtu))
+        }
+
+        // Fallback to classic L2CAP options
         var options = l2cap_options()
         var length = socklen_t(MemoryLayout<l2cap_options>.size)
         let result = withUnsafeMutablePointer(to: &options) { ptr in
@@ -322,6 +399,9 @@ enum BlueZL2CAP {
         }
 
         guard result == 0 else {
+            logger.trace("Using default MTU", metadata: [
+                "mtu": "\(BlueZL2CAPConstants.defaultMTU)"
+            ])
             return (BlueZL2CAPConstants.defaultMTU, BlueZL2CAPConstants.defaultMTU)
         }
 
@@ -376,26 +456,27 @@ enum BlueZL2CAP {
     }
 }
 
-/// Thread-safety note: This class is @unchecked Sendable because:
-/// 1. The file descriptor (fd) is immutable after initialization
-/// 2. Mutable state (closed, incomingStream, incomingTask) is protected by NSLock
-/// 3. All public methods use the lock before accessing mutable state
+/// L2CAP channel implementation using NIO for async I/O.
+///
+/// This implementation uses NIO's EventLoopGroup to schedule non-blocking socket reads,
+/// providing proper async/await integration without blocking executor threads.
 final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
     let psm: L2CAPPSM
     let mtu: Int
 
     private let fd: Int32
     private let incomingMTU: Int
+    private let eventLoopGroup: MultiThreadedEventLoopGroup
     private let lock = NSLock()
     private var closed = false
     private var incomingStream: AsyncThrowingStream<Data, Error>?
-    private var incomingTask: Task<Void, Never>?
 
     init(fd: Int32, psm: L2CAPPSM, mtu: Int, incomingMTU: Int) {
         self.fd = fd
         self.psm = psm
         self.mtu = mtu
         self.incomingMTU = incomingMTU
+        self.eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     }
 
     func send(_ data: Data) async throws {
@@ -408,30 +489,29 @@ final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
             throw BluetoothError.invalidState("L2CAP channel closed")
         }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let fd = fd
-            let payload = data
-            Task.detached {
-                let result = payload.withUnsafeBytes { buffer in
-                    guard let base = buffer.baseAddress else { return 0 }
-                    return system_send(fd, base, buffer.count, Int32(MSG_NOSIGNAL))
-                }
-                if result < 0 {
-                    let err = errno
-                    continuation.resume(throwing: BlueZL2CAP.systemError("L2CAP send", errnoCode: err))
-                    return
-                }
-                if result != payload.count {
-                    continuation.resume(throwing: BluetoothError.invalidState("L2CAP send truncated"))
-                    return
-                }
-                continuation.resume(returning: ())
+        let fd = self.fd
+        let eventLoop = eventLoopGroup.next()
+
+        try await eventLoop.submit {
+            let result = data.withUnsafeBytes { buffer in
+                guard let base = buffer.baseAddress else { return 0 }
+                return system_send(fd, base, buffer.count, Int32(MSG_NOSIGNAL))
             }
-        }
+            if result < 0 {
+                throw BlueZL2CAP.systemError("L2CAP send", errnoCode: errno)
+            }
+            if result != data.count {
+                throw BluetoothError.invalidState("L2CAP send truncated")
+            }
+            logger.trace("Sent L2CAP data", metadata: [
+                BluetoothLogMetadata.bytesCount: "\(data.count)"
+            ])
+        }.get()
     }
 
     func incoming() -> AsyncThrowingStream<Data, Error> {
         if withLock({ closed }) {
+            logger.debug("Incoming stream requested on closed channel")
             return AsyncThrowingStream { continuation in
                 continuation.finish(throwing: BluetoothError.invalidState("L2CAP channel closed"))
             }
@@ -440,8 +520,14 @@ final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
         var continuation: AsyncThrowingStream<Data, Error>.Continuation?
         let stream = withLock { () -> AsyncThrowingStream<Data, Error> in
             if let existing = incomingStream {
+                logger.trace("Returning existing incoming stream")
                 return existing
             }
+
+            logger.debug("Creating L2CAP incoming stream", metadata: [
+                BluetoothLogMetadata.psm: "\(psm.rawValue)",
+                "fd": "\(fd)"
+            ])
 
             let stream = AsyncThrowingStream<Data, Error> { streamContinuation in
                 continuation = streamContinuation
@@ -454,25 +540,21 @@ final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
             continuation.onTermination = { [weak self] _ in
                 self?.closeAsync()
             }
-            startReadLoop(
-                fd: fd,
-                bufferSize: max(incomingMTU, 1),
-                continuation: continuation
-            )
+            startNIOReadLoop(continuation: continuation)
         }
 
         return stream
     }
 
     func close() async {
-        closeNow()
+        await closeNow()
     }
 
     private func closeAsync() {
         Task { await close() }
     }
 
-    private func closeNow() {
+    private func closeNow() async {
         let shouldClose = withLock { () -> Bool in
             if closed {
                 return false
@@ -483,53 +565,96 @@ final class BlueZL2CAPChannel: L2CAPChannel, @unchecked Sendable {
 
         guard shouldClose else { return }
 
+        logger.debug("Closing L2CAP channel", metadata: [
+            BluetoothLogMetadata.psm: "\(psm.rawValue)"
+        ])
+
         _ = shutdown(fd, Int32(SHUT_RDWR))
         _ = system_close(fd)
-        let task = withLock { () -> Task<Void, Never>? in
-            let task = incomingTask
-            incomingTask = nil
-            return task
-        }
-        task?.cancel()
+
+        try? await eventLoopGroup.shutdownGracefully()
     }
 
-    private func startReadLoop(
-        fd: Int32,
-        bufferSize: Int,
+    /// Starts an async read loop using NIO's EventLoop for non-blocking I/O scheduling.
+    private func startNIOReadLoop(
         continuation: AsyncThrowingStream<Data, Error>.Continuation
     ) {
-        let task = Task.detached {
-            var buffer = [UInt8](repeating: 0, count: bufferSize)
-            while true {
-                let bytesRead = buffer.withUnsafeMutableBytes { ptr -> Int in
-                    guard let base = ptr.baseAddress else { return -1 }
-                    return recv(fd, base, ptr.count, 0)
-                }
+        let fd = self.fd
+        let bufferSize = max(incomingMTU, 1)
+        let eventLoop = eventLoopGroup.next()
 
-                if bytesRead > 0 {
-                    continuation.yield(Data(buffer[0..<bytesRead]))
-                    continue
-                }
+        // Set socket to non-blocking mode
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
-                if bytesRead == 0 {
-                    break
-                }
+        logger.trace("Starting NIO-scheduled read loop", metadata: ["fd": "\(fd)"])
 
-                let err = errno
-                if err == EINTR {
-                    continue
+        Task {
+            while !Task.isCancelled {
+                do {
+                    // Use NIO's EventLoop to schedule non-blocking reads
+                    // Buffer is created inside submit to avoid Sendable capture issues
+                    let data = try await eventLoop.submit { [bufferSize] () -> Data? in
+                        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                        let pollResult = poll(&pfd, 1, 100)  // Short timeout for responsiveness
+
+                        if pollResult < 0 {
+                            let err = errno
+                            if err == EINTR { return nil }
+                            throw BlueZL2CAP.systemError("L2CAP poll", errnoCode: err)
+                        }
+
+                        if pollResult == 0 {
+                            return nil  // Timeout, no data
+                        }
+
+                        if (pfd.revents & Int16(POLLHUP)) != 0 || (pfd.revents & Int16(POLLERR)) != 0 {
+                            throw BluetoothError.invalidState("L2CAP socket closed")
+                        }
+
+                        if (pfd.revents & Int16(POLLIN)) != 0 {
+                            var buffer = [UInt8](repeating: 0, count: bufferSize)
+                            let bytesRead = buffer.withUnsafeMutableBytes { ptr -> Int in
+                                guard let base = ptr.baseAddress else { return -1 }
+                                return recv(fd, base, ptr.count, 0)
+                            }
+
+                            if bytesRead > 0 {
+                                return Data(buffer[0..<bytesRead])
+                            }
+
+                            if bytesRead == 0 {
+                                throw BluetoothError.invalidState("L2CAP connection closed")
+                            }
+
+                            let err = errno
+                            if err == EINTR || err == EAGAIN || err == EWOULDBLOCK {
+                                return nil
+                            }
+                            throw BlueZL2CAP.systemError("L2CAP receive", errnoCode: err)
+                        }
+
+                        return nil
+                    }.get()
+
+                    if let data {
+                        logger.trace("Received L2CAP data", metadata: [
+                            BluetoothLogMetadata.bytesCount: "\(data.count)"
+                        ])
+                        continuation.yield(data)
+                    }
+                } catch {
+                    if case BluetoothError.invalidState = error {
+                        logger.debug("L2CAP read loop ended", metadata: [
+                            BluetoothLogMetadata.error: "\(error)"
+                        ])
+                    }
+                    continuation.finish(throwing: error)
+                    return
                 }
-                if err == EBADF || err == ENOTCONN || err == ECONNRESET {
-                    break
-                }
-                continuation.finish(throwing: BlueZL2CAP.systemError("L2CAP receive", errnoCode: err))
-                return
             }
-            continuation.finish()
-        }
 
-        withLock {
-            incomingTask = task
+            continuation.finish()
         }
     }
 
@@ -550,6 +675,9 @@ private enum BlueZL2CAPConstants {
     static let l2capOptions: Int32 = 0x01
     static let defaultMTU: Int = 672
     static let listenBacklog: Int32 = 5
+    // BLE L2CAP CoC MTU socket options
+    static let btRcvMTU: Int32 = 13
+    static let btSndMTU: Int32 = 14
 }
 
 private struct bdaddr_t: Sendable {

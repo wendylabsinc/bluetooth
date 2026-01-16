@@ -7,6 +7,7 @@ import Foundation
 #endif
 
 import DBUS
+import Logging
 import NIOCore
 
 #if canImport(Glibc)
@@ -25,6 +26,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     private let agentPath: String
     private let agentConfig: AgentConfig
     private let verbose: Bool
+    private let logger: Logger
 
     private var stateValue: PeripheralConnectionState = .connecting
     private var mtuValue: Int = 23
@@ -71,6 +73,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         self.agentController = agentController
         self.agentConfig = AgentConfig.load(verbose: self.verbose)
         self.agentPath = AgentConfig.makeAgentPath()
+        self.logger = BluetoothLogger.backend
     }
 
     var state: PeripheralConnectionState { stateValue }
@@ -450,9 +453,10 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             }
 
             if !isConnected() {
-                if verbose {
-                    print("[bluez] Connecting to \(devicePath)")
-                }
+                logger.debug("Connecting to device", metadata: [
+                    BluetoothLogMetadata.deviceAddress: "\(deviceAddress)",
+                    "path": "\(devicePath)"
+                ])
                 try await connectDevice(connection)
                 updateState(.connected)
                 try await loadDeviceProperties(connection)
@@ -462,9 +466,10 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             await waitForStop()
 
             if isConnected() {
-                if verbose {
-                    print("[bluez] Disconnecting from \(devicePath)")
-                }
+                logger.debug("Disconnecting from device", metadata: [
+                    BluetoothLogMetadata.deviceAddress: "\(deviceAddress)",
+                    "path": "\(devicePath)"
+                ])
                 try await disconnectDevice(connection)
                 updateState(.disconnected(reason: nil))
             }
@@ -532,9 +537,10 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         guard agentController == nil else { return }
         guard !agentRegistered else { return }
 
-        if verbose {
-            print("[bluez] Registering agent at \(agentPath) (\(agentConfig.capability))")
-        }
+        logger.debug("Registering agent", metadata: [
+            "path": "\(agentPath)",
+            "capability": "\(agentConfig.capability)"
+        ])
 
         let registerRequest = DBusRequest.createMethodCall(
             destination: client.busName,
@@ -587,14 +593,14 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         do {
             if let reply = try await connection.send(request), reply.messageType == .error {
                 let name = client.dbusErrorName(reply) ?? "org.freedesktop.DBus.Error.Failed"
-                if verbose {
-                    print("[bluez] UnregisterAgent failed: \(name)")
-                }
+                logger.debug("UnregisterAgent failed", metadata: [
+                    BluetoothLogMetadata.error: "\(name)"
+                ])
             }
         } catch {
-            if verbose {
-                print("[bluez] UnregisterAgent failed: \(error)")
-            }
+            logger.debug("UnregisterAgent failed", metadata: [
+                BluetoothLogMetadata.error: "\(error)"
+            ])
         }
 
         agentRegistered = false
@@ -608,9 +614,10 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
             return
         }
 
-        if verbose {
-            print("[bluez] Pairing with \(devicePath)")
-        }
+        logger.debug("Pairing with device", metadata: [
+            BluetoothLogMetadata.deviceAddress: "\(deviceAddress)",
+            "path": "\(devicePath)"
+        ])
 
         let request = DBusRequest.createMethodCall(
             destination: client.busName,
@@ -731,8 +738,11 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
                 )
             }
         case "DisplayPinCode":
-            if verbose, let device = message.body.first?.objectPath, let code = message.body.dropFirst().first?.string {
-                print("[bluez] DisplayPinCode for \(device): \(code)")
+            if let device = message.body.first?.objectPath, let code = message.body.dropFirst().first?.string {
+                logger.info("Display PIN code", metadata: [
+                    "device": "\(device)",
+                    "code": "\(code)"
+                ])
             }
             await sendAgentReply(message, connection: connection)
         case "RequestPasskey":
@@ -747,19 +757,23 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
                 )
             }
         case "DisplayPasskey":
-            if verbose,
-               let device = message.body.first?.objectPath,
+            if let device = message.body.first?.objectPath,
                let passkey = message.body.dropFirst().first?.uint32
             {
-                print("[bluez] DisplayPasskey for \(device): \(passkey)")
+                logger.info("Display passkey", metadata: [
+                    "device": "\(device)",
+                    "passkey": "\(passkey)"
+                ])
             }
             await sendAgentReply(message, connection: connection)
         case "RequestConfirmation":
-            if verbose,
-               let device = message.body.first?.objectPath,
+            if let device = message.body.first?.objectPath,
                let passkey = message.body.dropFirst().first?.uint32
             {
-                print("[bluez] RequestConfirmation for \(device): \(passkey)")
+                logger.info("Request confirmation", metadata: [
+                    "device": "\(device)",
+                    "passkey": "\(passkey)"
+                ])
             }
             if agentConfig.autoAccept {
                 await sendAgentReply(message, connection: connection)
@@ -816,9 +830,9 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
                 DBusRequest.createMethodReturn(replyingTo: message, body: body)
             )
         } catch {
-            if verbose {
-                print("[bluez] Agent reply failed: \(error)")
-            }
+            logger.debug("Agent reply failed", metadata: [
+                BluetoothLogMetadata.error: "\(error)"
+            ])
         }
     }
 
@@ -838,9 +852,9 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
                 )
             )
         } catch {
-            if verbose {
-                print("[bluez] Agent error reply failed: \(error)")
-            }
+            logger.debug("Agent error reply failed", metadata: [
+                BluetoothLogMetadata.error: "\(error)"
+            ])
         }
     }
 
@@ -1346,12 +1360,16 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         let autoAccept: Bool
 
         static func load(verbose: Bool) -> AgentConfig {
+            let logger = BluetoothLogger.backend
             let env = ProcessInfo.processInfo.environment
             let capabilityValue = env["BLUETOOTH_BLUEZ_AGENT_CAPABILITY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let normalized = normalizeCapability(capabilityValue)
 
-            if verbose, let capabilityValue, !capabilityValue.isEmpty, normalized != capabilityValue {
-                print("[bluez] Unknown agent capability \"\(capabilityValue)\", using \(normalized)")
+            if let capabilityValue, !capabilityValue.isEmpty, normalized != capabilityValue {
+                logger.warning("Unknown agent capability", metadata: [
+                    "provided": "\(capabilityValue)",
+                    "using": "\(normalized)"
+                ])
             }
 
             let pin = env["BLUETOOTH_BLUEZ_AGENT_PIN"]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1359,8 +1377,8 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
 
             let passkeyValue = env["BLUETOOTH_BLUEZ_AGENT_PASSKEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let passkey = passkeyValue.flatMap { UInt32($0) }
-            if verbose, passkeyValue != nil, passkey == nil {
-                print("[bluez] Invalid BLUETOOTH_BLUEZ_AGENT_PASSKEY value")
+            if passkeyValue != nil, passkey == nil {
+                logger.warning("Invalid BLUETOOTH_BLUEZ_AGENT_PASSKEY value")
             }
 
             let autoAcceptValue = env["BLUETOOTH_BLUEZ_AGENT_AUTO_ACCEPT"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
