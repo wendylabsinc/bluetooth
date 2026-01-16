@@ -1,11 +1,11 @@
 #if canImport(FoundationEssentials)
-import FoundationEssentials
+  import FoundationEssentials
 #else
-import Foundation
+  import Foundation
 #endif
 
 public enum PairingState: Sendable, Hashable {
-    case unknown
-    case unpaired
-    case paired
+  case unknown
+  case unpaired
+  case paired
 }

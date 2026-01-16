@@ -1,61 +1,61 @@
 enum _BackendFactory {
-    static func makeCentral(options: BluetoothOptions) -> any _CentralBackend {
-#if BLUETOOTH_BACKEND_FORCE_COREBLUETOOTH
-#if canImport(CoreBluetooth)
+  static func makeCentral(options: BluetoothOptions) -> any _CentralBackend {
+    #if BLUETOOTH_BACKEND_FORCE_COREBLUETOOTH
+      #if canImport(CoreBluetooth)
         return _CoreBluetoothCentralBackend()
-#else
+      #else
         return _UnsupportedCentralBackend()
-#endif
-#elseif BLUETOOTH_BACKEND_FORCE_BLUEZ
-#if os(Linux)
+      #endif
+    #elseif BLUETOOTH_BACKEND_FORCE_BLUEZ
+      #if os(Linux)
         return _BlueZCentralBackend(options: options)
-#else
+      #else
         return _UnsupportedCentralBackend()
-#endif
-#elseif BLUETOOTH_BACKEND_FORCE_WINDOWS
-#if os(Windows)
+      #endif
+    #elseif BLUETOOTH_BACKEND_FORCE_WINDOWS
+      #if os(Windows)
         return _WindowsCentralBackend()
-#else
+      #else
         return _UnsupportedCentralBackend()
-#endif
-#elseif canImport(CoreBluetooth)
-        return _CoreBluetoothCentralBackend()
-#elseif os(Linux)
-        return _BlueZCentralBackend(options: options)
-#elseif os(Windows)
-        return _WindowsCentralBackend()
-#else
-        return _UnsupportedCentralBackend()
-#endif
-    }
+      #endif
+    #elseif canImport(CoreBluetooth)
+      return _CoreBluetoothCentralBackend()
+    #elseif os(Linux)
+      return _BlueZCentralBackend(options: options)
+    #elseif os(Windows)
+      return _WindowsCentralBackend()
+    #else
+      return _UnsupportedCentralBackend()
+    #endif
+  }
 
-    static func makePeripheral(options: BluetoothOptions) -> any _PeripheralBackend {
-#if BLUETOOTH_BACKEND_FORCE_COREBLUETOOTH
-#if canImport(CoreBluetooth)
+  static func makePeripheral(options: BluetoothOptions) -> any _PeripheralBackend {
+    #if BLUETOOTH_BACKEND_FORCE_COREBLUETOOTH
+      #if canImport(CoreBluetooth)
         return _CoreBluetoothPeripheralBackend()
-#else
+      #else
         return _UnsupportedPeripheralBackend()
-#endif
-#elseif BLUETOOTH_BACKEND_FORCE_BLUEZ
-#if os(Linux)
+      #endif
+    #elseif BLUETOOTH_BACKEND_FORCE_BLUEZ
+      #if os(Linux)
         return _BlueZPeripheralBackend(options: options)
-#else
+      #else
         return _UnsupportedPeripheralBackend()
-#endif
-#elseif BLUETOOTH_BACKEND_FORCE_WINDOWS
-#if os(Windows)
+      #endif
+    #elseif BLUETOOTH_BACKEND_FORCE_WINDOWS
+      #if os(Windows)
         return _WindowsPeripheralBackend()
-#else
+      #else
         return _UnsupportedPeripheralBackend()
-#endif
-#elseif canImport(CoreBluetooth)
-        return _CoreBluetoothPeripheralBackend()
-#elseif os(Linux)
-        return _BlueZPeripheralBackend(options: options)
-#elseif os(Windows)
-        return _WindowsPeripheralBackend()
-#else
-        return _UnsupportedPeripheralBackend()
-#endif
-    }
+      #endif
+    #elseif canImport(CoreBluetooth)
+      return _CoreBluetoothPeripheralBackend()
+    #elseif os(Linux)
+      return _BlueZPeripheralBackend(options: options)
+    #elseif os(Windows)
+      return _WindowsPeripheralBackend()
+    #else
+      return _UnsupportedPeripheralBackend()
+    #endif
+  }
 }

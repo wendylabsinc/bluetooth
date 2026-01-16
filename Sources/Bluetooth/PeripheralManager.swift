@@ -1,108 +1,115 @@
 #if canImport(FoundationEssentials)
-import FoundationEssentials
+  import FoundationEssentials
 #else
-import Foundation
+  import Foundation
 #endif
 
 public actor PeripheralManager {
-    private let backend: any _PeripheralBackend
+  private let backend: any _PeripheralBackend
 
-    public init(options: BluetoothOptions = .init()) {
-        self.backend = _BackendFactory.makePeripheral(options: options)
-    }
+  public init(options: BluetoothOptions = .init()) {
+    self.backend = _BackendFactory.makePeripheral(options: options)
+  }
 
-    init(backend: any _PeripheralBackend) {
-        self.backend = backend
-    }
+  init(backend: any _PeripheralBackend) {
+    self.backend = backend
+  }
 
-    public func state() -> BluetoothState {
-        backend.state
-    }
+  public func state() -> BluetoothState {
+    backend.state
+  }
 
-    public func stateUpdates() -> AsyncStream<BluetoothState> {
-        backend.stateUpdates()
-    }
+  public func stateUpdates() -> AsyncStream<BluetoothState> {
+    backend.stateUpdates()
+  }
 
-    public func connectionEvents() async throws -> AsyncThrowingStream<PeripheralConnectionEvent, Error> {
-        try await backend.connectionEvents()
-    }
+  public func connectionEvents() async throws -> AsyncThrowingStream<
+    PeripheralConnectionEvent, Error
+  > {
+    try await backend.connectionEvents()
+  }
 
-    public func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
-        try await backend.pairingRequests()
-    }
+  public func pairingRequests() async throws -> AsyncThrowingStream<PairingRequest, Error> {
+    try await backend.pairingRequests()
+  }
 
-    public func startAdvertising(
-        _ advertisingData: AdvertisementData,
-        parameters: AdvertisingParameters = .init()
-    ) async throws {
-        try await startAdvertising(advertisingData: advertisingData, scanResponseData: nil, parameters: parameters)
-    }
+  public func startAdvertising(
+    _ advertisingData: AdvertisementData,
+    parameters: AdvertisingParameters = .init()
+  ) async throws {
+    try await startAdvertising(
+      advertisingData: advertisingData, scanResponseData: nil, parameters: parameters)
+  }
 
-    public func startAdvertising(
-        advertisingData: AdvertisementData,
-        scanResponseData: AdvertisementData? = nil,
-        parameters: AdvertisingParameters = .init()
-    ) async throws {
-        try await backend.startAdvertising(
-            advertisingData: advertisingData,
-            scanResponseData: scanResponseData,
-            parameters: parameters
-        )
-    }
+  public func startAdvertising(
+    advertisingData: AdvertisementData,
+    scanResponseData: AdvertisementData? = nil,
+    parameters: AdvertisingParameters = .init()
+  ) async throws {
+    try await backend.startAdvertising(
+      advertisingData: advertisingData,
+      scanResponseData: scanResponseData,
+      parameters: parameters
+    )
+  }
 
-    public func startAdvertisingSet(_ configuration: AdvertisingSetConfiguration) async throws -> AdvertisingSetID {
-        try await backend.startAdvertisingSet(configuration)
-    }
+  public func startAdvertisingSet(_ configuration: AdvertisingSetConfiguration) async throws
+    -> AdvertisingSetID
+  {
+    try await backend.startAdvertisingSet(configuration)
+  }
 
-    public func updateAdvertisingSet(_ id: AdvertisingSetID, configuration: AdvertisingSetConfiguration) async throws {
-        try await backend.updateAdvertisingSet(id, configuration: configuration)
-    }
+  public func updateAdvertisingSet(
+    _ id: AdvertisingSetID, configuration: AdvertisingSetConfiguration
+  ) async throws {
+    try await backend.updateAdvertisingSet(id, configuration: configuration)
+  }
 
-    public func stopAdvertising() async {
-        await backend.stopAdvertising()
-    }
+  public func stopAdvertising() async {
+    await backend.stopAdvertising()
+  }
 
-    public func stopAdvertisingSet(_ id: AdvertisingSetID) async {
-        await backend.stopAdvertisingSet(id)
-    }
+  public func stopAdvertisingSet(_ id: AdvertisingSetID) async {
+    await backend.stopAdvertisingSet(id)
+  }
 
-    public func disconnect(_ central: Central) async throws {
-        try await backend.disconnect(central)
-    }
+  public func disconnect(_ central: Central) async throws {
+    try await backend.disconnect(central)
+  }
 
-    public func removeBond(for central: Central) async throws {
-        try await backend.removeBond(for: central)
-    }
+  public func removeBond(for central: Central) async throws {
+    try await backend.removeBond(for: central)
+  }
 
-    public func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
-        try await backend.addService(service)
-    }
+  public func addService(_ service: GATTServiceDefinition) async throws -> GATTServiceRegistration {
+    try await backend.addService(service)
+  }
 
-    public func removeService(_ registration: GATTServiceRegistration) async throws {
-        try await backend.removeService(registration)
-    }
+  public func removeService(_ registration: GATTServiceRegistration) async throws {
+    try await backend.removeService(registration)
+  }
 
-    public func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {
-        try await backend.gattRequests()
-    }
+  public func gattRequests() async throws -> AsyncThrowingStream<GATTServerRequest, Error> {
+    try await backend.gattRequests()
+  }
 
-    public func updateValue(
-        _ value: Data,
-        for characteristic: GATTCharacteristic,
-        type: GATTServerUpdateType = .notification
-    ) async throws {
-        try await backend.updateValue(value, for: characteristic, type: type)
-    }
+  public func updateValue(
+    _ value: Data,
+    for characteristic: GATTCharacteristic,
+    type: GATTServerUpdateType = .notification
+  ) async throws {
+    try await backend.updateValue(value, for: characteristic, type: type)
+  }
 
-    public func publishL2CAPChannel(
-        parameters: L2CAPChannelParameters = .init()
-    ) async throws -> L2CAPPSM {
-        try await backend.publishL2CAPChannel(parameters: parameters)
-    }
+  public func publishL2CAPChannel(
+    parameters: L2CAPChannelParameters = .init()
+  ) async throws -> L2CAPPSM {
+    try await backend.publishL2CAPChannel(parameters: parameters)
+  }
 
-    public func incomingL2CAPChannels(
-        psm: L2CAPPSM
-    ) async throws -> AsyncThrowingStream<any L2CAPChannel, Error> {
-        try await backend.incomingL2CAPChannels(psm: psm)
-    }
+  public func incomingL2CAPChannels(
+    psm: L2CAPPSM
+  ) async throws -> AsyncThrowingStream<any L2CAPChannel, Error> {
+    try await backend.incomingL2CAPChannels(psm: psm)
+  }
 }
