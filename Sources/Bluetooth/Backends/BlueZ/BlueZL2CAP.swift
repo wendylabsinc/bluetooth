@@ -66,6 +66,13 @@
           ])
         let fd = try createSocket()
 
+        // Set listener socket to non-blocking mode
+        let flags = fcntl(fd, F_GETFL, 0)
+        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+          closeSocket(fd)
+          throw systemError("L2CAP fcntl", errnoCode: errno)
+        }
+
         switch bindAndListen(fd: fd, addressType: addressType) {
         case .success(let psm):
           logger.debug(
@@ -148,7 +155,7 @@
     /// Accepts a connection on the listener socket using NIO's event loop for non-blocking I/O.
     private static func acceptConnection(listenerFD: Int32) async -> Int32 {
       await withCheckedContinuation { continuation in
-        eventLoopGroup.next().execute {
+        func tryAccept(on eventLoop: EventLoop) {
           var addr = sockaddr_l2()
           var length = socklen_t(MemoryLayout<sockaddr_l2>.size)
           let clientFD = withUnsafeMutablePointer(to: &addr) { ptr in
@@ -157,11 +164,24 @@
             }
           }
 
-          if clientFD < 0 {
-            continuation.resume(returning: -errno)
-          } else {
+          if clientFD >= 0 {
             continuation.resume(returning: clientFD)
+          } else {
+            let err = errno
+            if err == EAGAIN || err == EWOULDBLOCK {
+              // No connection pending - schedule retry after short delay
+              eventLoop.scheduleTask(in: .milliseconds(10)) {
+                tryAccept(on: eventLoop)
+              }
+            } else {
+              continuation.resume(returning: -err)
+            }
           }
+        }
+
+        let eventLoop = eventLoopGroup.next()
+        eventLoop.execute {
+          tryAccept(on: eventLoop)
         }
       }
     }
