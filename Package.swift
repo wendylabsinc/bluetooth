@@ -55,7 +55,7 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
-    .package(url: "https://github.com/wendylabsinc/dbus.git", branch: "feature/dbus-hardening"),
+    .package(url: "https://github.com/wendylabsinc/dbus.git", from: "0.3.0"),
     .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0"),
     .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
   ],
