@@ -41,19 +41,10 @@ struct DiscoveryExample: AsyncParsableCommand {
     @Flag(name: .long, help: "Allow duplicate advertisements.")
     var duplicates: Bool = false
 
-    @Flag(name: .long, help: "Enable BlueZ backend verbose logging.")
-    var verbose: Bool = false
-
     @Option(name: .long, help: "Bluetooth adapter (e.g. hci0).")
     var adapter: String?
 
     mutating func run() async throws {
-        if verbose {
-            #if !os(Windows)
-            setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
-            #endif
-        }
-
         let uuids = try serviceUUIDs.map { value in
             guard let parsed = Self.parseBluetoothUUID(value) else {
                 throw ValidationError("Invalid UUID: \(value)")

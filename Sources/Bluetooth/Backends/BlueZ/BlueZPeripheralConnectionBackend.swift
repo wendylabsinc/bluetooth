@@ -25,7 +25,6 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
     private let agentController: _BlueZPeripheralAgentController?
     private let agentPath: String
     private let agentConfig: AgentConfig
-    private let verbose: Bool
     private let logger: Logger
 
     private var stateValue: PeripheralConnectionState = .connecting
@@ -68,10 +67,9 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         self.adapterPath = adapterPath
         self.deviceAddress = address
         self.devicePath = "\(adapterPath)/dev_" + address.uppercased().replacingOccurrences(of: ":", with: "_")
-        self.verbose = ProcessInfo.processInfo.environment["BLUETOOTH_BLUEZ_VERBOSE"] == "1"
         self.requiresBonding = options.requiresBonding
         self.agentController = agentController
-        self.agentConfig = AgentConfig.load(verbose: self.verbose)
+        self.agentConfig = AgentConfig.load()
         self.agentPath = AgentConfig.makeAgentPath()
         self.logger = BluetoothLogger.backend
     }
@@ -1359,7 +1357,7 @@ actor _BlueZPeripheralConnectionBackend: _PeripheralConnectionBackend {
         let passkey: UInt32?
         let autoAccept: Bool
 
-        static func load(verbose: Bool) -> AgentConfig {
+        static func load() -> AgentConfig {
             let logger = BluetoothLogger.backend
             let env = ProcessInfo.processInfo.environment
             let capabilityValue = env["BLUETOOTH_BLUEZ_AGENT_CAPABILITY"]?.trimmingCharacters(in: .whitespacesAndNewlines)

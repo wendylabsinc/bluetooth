@@ -301,7 +301,7 @@ struct _BlueZPeripheralBackend: _PeripheralBackend {
                 Task { await l2capManager.stop(psm: psm) }
             }
             Task.detached {
-                BlueZL2CAP.acceptLoop(listener: listener, continuation: continuation)
+                await BlueZL2CAP.acceptLoop(listener: listener, continuation: continuation)
             }
         }
     }

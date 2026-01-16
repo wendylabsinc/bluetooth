@@ -34,19 +34,10 @@ struct L2CAPClientExample: AsyncParsableCommand {
     @Option(name: .long, help: "Milliseconds to stay connected before exiting.")
     var time: UInt64?
 
-    @Flag(name: .long, help: "Enable BlueZ backend verbose logging.")
-    var verbose: Bool = false
-
     @Option(name: .long, help: "Bluetooth adapter (e.g. hci0).")
     var adapter: String?
 
     mutating func run() async throws {
-        if verbose {
-            #if !os(Windows)
-            setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
-            #endif
-        }
-
         let parsedPSM = try parsePSM(psm)
         let options = BluetoothOptions(adapter: adapter.map(BluetoothAdapter.init))
         let manager = CentralManager(options: options)

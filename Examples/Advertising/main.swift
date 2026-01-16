@@ -27,9 +27,6 @@ struct AdvertisingExample: AsyncParsableCommand {
     @Option(name: .long, help: "Local name to advertise.")
     var name: String = "wendylabsinc/bluetooth-advertising-example"
 
-    @Flag(name: .long, help: "Enable BlueZ backend verbose logging.")
-    var verbose: Bool = false
-
     @Flag(name: .long, help: "Advertise as connectable (may trigger pairing prompts).")
     var connectable: Bool = false
 
@@ -37,12 +34,6 @@ struct AdvertisingExample: AsyncParsableCommand {
     var adapter: String?
 
     mutating func run() async throws {
-        if verbose {
-            #if !os(Windows)
-            setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
-            #endif
-        }
-
         let options = BluetoothOptions(adapter: adapter.map(BluetoothAdapter.init))
         let manager = PeripheralManager(options: options)
         let advertisingData = AdvertisementData(localName: name)

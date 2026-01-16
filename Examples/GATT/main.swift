@@ -31,9 +31,6 @@ struct GATTExample: AsyncParsableCommand {
     @Flag(inversion: .prefixedNo, help: "Advertise as connectable (required for GATT connections).")
     var connectable: Bool = true
 
-    @Flag(name: .long, help: "Enable BlueZ backend verbose logging.")
-    var verbose: Bool = false
-
     @Option(name: .long, help: "Bluetooth adapter (e.g. hci0).")
     var adapter: String?
 
@@ -56,12 +53,6 @@ struct GATTExample: AsyncParsableCommand {
     var pairingAutoAccept: Bool = true
 
     mutating func run() async throws {
-        if verbose {
-            #if !os(Windows)
-            setenv("BLUETOOTH_BLUEZ_VERBOSE", "1", 1)
-            #endif
-        }
-
         var pairingTask: Task<Void, Never>?
 
         let options = BluetoothOptions(adapter: adapter.map(BluetoothAdapter.init))
